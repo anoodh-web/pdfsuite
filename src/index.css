@@ -1,0 +1,105 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom text-tool font families — same files used for both on-screen
+   preview here and PDF embedding (see fontFileMap in the store), so what
+   you see while typing matches what's actually baked into the export. */
+@font-face {
+  font-family: 'PDFSuite Display';
+  src: url('/fonts/PlayfairDisplay.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Handwriting';
+  src: url('/fonts/GochiHand.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Condensed';
+  src: url('/fonts/Oswald.ttf') format('truetype');
+  font-display: swap;
+}
+
+/* Theme tokens. Colors are stored as "R G B" triplets (not hex) so Tailwind's
+   opacity-modifier classes (e.g. bg-accent/20) work via rgb(var(--x) / alpha).
+   Burgundy (#6E1B36 = 110 27 54, sampled from the app logo) is the shared
+   accent across both themes. Body text is pure black in light mode and pure
+   white in dark mode, per spec — branding elements (e.g. the app title next
+   to the logo) intentionally opt out of this and stay burgundy instead,
+   applied directly where used rather than through this shared token. */
+:root,
+:root[data-theme='dark'] {
+  --ink-900: 11 13 15;
+  --ink-800: 20 23 26;
+  --ink-700: 29 33 36;
+  --ink-600: 38 43 47;
+  --ink-500: 52 59 64;
+  --paper: 255 255 255;
+  --muted: 158 148 152;
+  --accent: 110 27 54;
+  --accent-dim: 78 19 39;
+  --accent-soft: rgba(110, 27, 54, 0.32);
+  --signal-success: 43 182 115;
+  --signal-warn: 227 167 47;
+  --signal-danger: 227 82 79;
+}
+
+:root[data-theme='light'] {
+  --ink-900: 255 255 255;
+  --ink-800: 255 255 255;
+  --ink-700: 241 244 245;
+  --ink-600: 230 235 237;
+  --ink-500: 205 213 217;
+  --paper: 0 0 0;
+  --muted: 110 90 96;
+  --accent: 110 27 54;
+  --accent-dim: 78 19 39;
+  --accent-soft: rgba(110, 27, 54, 0.14);
+  --signal-success: 30 142 90;
+  --signal-warn: 158 108 9;
+  --signal-danger: 194 59 56;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: rgb(var(--ink-900));
+  transition: background-color 0.15s ease;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgb(var(--ink-500)); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--muted)); }
+
+/* Minimal pdf.js text-layer styling (from pdfjs-dist/web/pdf_viewer.css),
+   trimmed to what we need for real, native text selection over the canvas. */
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  text-align: initial;
+  letter-spacing: normal;
+  word-spacing: normal;
+  transform-origin: 0 0;
+  --total-scale-factor: 1;
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+.textLayer span,
+.textLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+.textLayer ::selection {
+  background: rgba(62, 111, 243, 0.35);
+}
+
