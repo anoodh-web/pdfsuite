@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import Ribbon from './components/Ribbon';
 import ThumbnailRail from './components/ThumbnailRail';
 import DocumentTabs from './components/DocumentTabs';
@@ -7,10 +7,18 @@ import RightPanel from './components/RightPanel';
 import StatusBar from './components/StatusBar';
 import PasswordPrompt from './components/PasswordPrompt';
 import BottomDock from './components/BottomDock';
+import Toast from './components/Toast';
+import OnboardingPrompt from './components/OnboardingPrompt';
 import { useDocumentStore } from './store/useDocumentStore';
 
 export default function App() {
   const theme = useDocumentStore((s) => s.theme);
+  const userProfile = useDocumentStore((s) => s.userProfile);
+  // "Skip for now" only dismisses it for this session — a genuinely fresh
+  // launch (new browser session, or reopening the desktop app) with no
+  // saved profile will show it again, matching "trigger immediately on
+  // launch" rather than a one-time nag that can be permanently avoided.
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -30,6 +38,10 @@ export default function App() {
       </div>
       <StatusBar />
       <PasswordPrompt />
+      <Toast />
+      {!userProfile && !onboardingDismissed && (
+        <OnboardingPrompt onDone={() => setOnboardingDismissed(true)} />
+      )}
     </div>
   );
 }

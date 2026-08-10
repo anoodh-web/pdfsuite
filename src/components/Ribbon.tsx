@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import {
   Hand,
   MousePointer2,
@@ -46,6 +46,8 @@ import {
   LayoutGrid,
   FileUp,
   GitCompare,
+  PlayCircle,
+  ArrowRight,
   FolderOpen,
   Printer,
   Mail,
@@ -137,6 +139,7 @@ export default function Ribbon() {
     exportToWord,
     exportToPng,
     compressDocument,
+    showToast,
     formFields,
     lineEdits,
     flattenForm,
@@ -253,6 +256,29 @@ export default function Ribbon() {
   const [findQuery, setFindQuery] = useState('');
   const [findStatus, setFindStatus] = useState<string | null>(null);
 
+  // Convert tab: explicit "select, then Convert" workflow rather than
+  // converting the instant a format/file is picked.
+  const [exportFormat, setExportFormat] = useState<'word' | 'png'>('word');
+  const [stagedWordFile, setStagedWordFile] = useState<File | null>(null);
+  const [stagedImageFiles, setStagedImageFiles] = useState<File[]>([]);
+  const [imagePreviewUrls, setImagePreviewUrls] = useState<string[]>([]);
+
+  // Build real thumbnail previews for staged images (and clean up the
+  // object URLs afterward) — this is the actual fix for "I can't see what
+  // I selected before converting": there was previously no visual preview
+  // at all, just the filename as text.
+  useEffect(() => {
+    if (stagedImageFiles.length === 0) {
+      setImagePreviewUrls([]);
+      return;
+    }
+    const urls = stagedImageFiles.map((f) => URL.createObjectURL(f));
+    setImagePreviewUrls(urls);
+    return () => {
+      urls.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [stagedImageFiles]);
+
   const handleFind = async () => {
     if (!doc || !findQuery.trim()) return;
     setFindStatus('Searching…');
@@ -267,26 +293,23 @@ export default function Ribbon() {
     }
   };
 
-  const handleConvertWord = async () => {
+  // Export: pick Word or PNG with the toggle buttons, then click Convert
+  const handleRunExport = async () => {
     if (!doc) return;
     setConverting(true);
     setConvertError(null);
     try {
-      await exportToWord(doc.id);
+      if (exportFormat === 'word') {
+        await exportToWord(doc.id);
+        showToast('The file has been successfully converted to Word and saved.');
+      } else {
+        await exportToPng(doc.id);
+        showToast('The file has been successfully converted to PNG and saved.');
+      }
     } catch (e) {
-      setConvertError(e instanceof Error ? e.message : String(e));
-    }
-    setConverting(false);
-  };
-
-  const handleConvertPng = async () => {
-    if (!doc) return;
-    setConverting(true);
-    setConvertError(null);
-    try {
-      await exportToPng(doc.id);
-    } catch (e) {
-      setConvertError(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      setConvertError(message);
+      showToast(`Conversion failed: ${message}`, 'error');
     }
     setConverting(false);
   };
@@ -296,31 +319,61 @@ export default function Ribbon() {
     setConvertError(null);
     setCompressResult(null);
     const result = await compressDocument(doc.id, level);
-    if (result) setCompressResult(result);
-    else setConvertError('Compression failed — see the browser console for details.');
+    if (result) {
+      setCompressResult(result);
+      showToast(
+        `Compressed successfully — ${formatBytes(result.originalSize)} \u2192 ${formatBytes(result.compressedSize)} (${result.savedPct}% smaller).`
+      );
+    } else {
+      setConvertError('Compression failed — see the browser console for details.');
+      showToast('Compression failed.', 'error');
+    }
   };
 
-  const handleWordToPdfChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Import: pick a Word file or image(s) — this only stages the selection
+  // (shown next to the Convert button); nothing happens until Convert is
+  // actually clicked.
+  const handleWordToPdfChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
-    setConverting(true);
+    setStagedImageFiles([]);
+    setStagedWordFile(file);
     setConvertError(null);
-    const result = await convertWordToPdf(file);
-    if (!result.ok) setConvertError(result.error);
-    setConverting(false);
   };
 
-  const handleConvertImagesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleConvertImagesChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? []);
     e.target.value = '';
     if (files.length === 0) return;
+    setStagedWordFile(null);
+    setStagedImageFiles(files);
+    setConvertError(null);
+  };
+
+  const handleRunImport = async () => {
+    if (!stagedWordFile && stagedImageFiles.length === 0) return;
     setConverting(true);
     setConvertError(null);
     try {
-      await createPdfFromImages(files);
+      if (stagedWordFile) {
+        const result = await convertWordToPdf(stagedWordFile);
+        if (!result.ok) {
+          setConvertError(result.error);
+          showToast(`Conversion failed: ${result.error}`, 'error');
+        } else {
+          showToast('The file has been successfully converted and saved.');
+        }
+      } else {
+        await createPdfFromImages(stagedImageFiles);
+        showToast('The file has been successfully converted and saved.');
+      }
+      setStagedWordFile(null);
+      setStagedImageFiles([]);
     } catch (err) {
-      setConvertError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setConvertError(message);
+      showToast(`Conversion failed: ${message}`, 'error');
     }
     setConverting(false);
   };
@@ -596,37 +649,116 @@ export default function Ribbon() {
 
         {activeRibbonTab === 'Convert' && (
           <>
-            <RibbonGroup title="Import">
-              <RibbonButton
-                icon={FileUp}
-                label="Word to PDF"
-                large
-                disabled={converting}
-                onClick={() => wordInputRef.current?.click()}
-              />
-              <RibbonButton
-                icon={ImagePlus}
-                label="Image to PDF"
-                large
-                onClick={() => convertImageInputRef.current?.click()}
-              />
-            </RibbonGroup>
-            <RibbonGroup title="Export">
-              <RibbonButton
-                icon={FileText}
-                label="To Word"
-                large
-                disabled={!doc || converting}
-                onClick={() => doc && handleConvertWord()}
-              />
-              <RibbonButton
-                icon={ImageIcon}
-                label="To PNG"
-                large
-                disabled={!doc || converting}
-                onClick={() => doc && handleConvertPng()}
-              />
-            </RibbonGroup>
+            <div className="relative flex flex-col items-center justify-center px-3">
+              <div className="mb-1 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-accent">
+                PDF <ArrowRight size={11} /> Word / PNG
+              </div>
+              <div className="flex items-center gap-1">
+                <RibbonButton
+                  icon={FileText}
+                  label="Word"
+                  large
+                  active={exportFormat === 'word'}
+                  onClick={() => setExportFormat('word')}
+                />
+                <RibbonButton
+                  icon={ImageIcon}
+                  label="PNG"
+                  large
+                  active={exportFormat === 'png'}
+                  onClick={() => setExportFormat('png')}
+                />
+                <button
+                  disabled={!doc || converting}
+                  onClick={handleRunExport}
+                  className="ml-1 flex h-16 w-20 flex-col items-center justify-center gap-1 rounded-md bg-accent text-[11px] font-medium text-white hover:bg-accent-dim disabled:opacity-40"
+                >
+                  <PlayCircle size={18} />
+                  Convert
+                </button>
+              </div>
+              <div className="pointer-events-none absolute right-0 top-1/2 h-8 w-px -translate-y-1/2 bg-gradient-to-b from-transparent via-ink-500 to-transparent" />
+            </div>
+
+            <div className="relative flex flex-col items-center justify-center px-3">
+              <div className="mb-1 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-accent">
+                Word / PNG <ArrowRight size={11} /> PDF
+              </div>
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-1">
+                  <RibbonButton
+                    icon={FileUp}
+                    label="Choose Word File"
+                    large
+                    active={!!stagedWordFile}
+                    onClick={() => wordInputRef.current?.click()}
+                  />
+                  <RibbonButton
+                    icon={ImagePlus}
+                    label="Choose Images"
+                    large
+                    active={stagedImageFiles.length > 0}
+                    onClick={() => convertImageInputRef.current?.click()}
+                  />
+                  <button
+                    disabled={(!stagedWordFile && stagedImageFiles.length === 0) || converting}
+                    onClick={handleRunImport}
+                    className="ml-1 flex h-16 w-20 flex-col items-center justify-center gap-1 rounded-md bg-accent text-[11px] font-medium text-white hover:bg-accent-dim disabled:opacity-40"
+                  >
+                    <PlayCircle size={18} />
+                    Convert
+                  </button>
+                </div>
+                {(stagedWordFile || stagedImageFiles.length > 0) && (
+                  <div className="flex items-start gap-2 rounded-md border border-ink-500 bg-ink-800 p-1.5">
+                    {stagedWordFile ? (
+                      <div className="flex items-center gap-2">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded bg-accent-soft text-accent">
+                          <FileText size={16} />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="max-w-[140px] truncate text-[11px] text-paper/90">
+                            {stagedWordFile.name}
+                          </div>
+                          <div className="text-[10px] text-muted">
+                            {formatBytes(stagedWordFile.size)}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1">
+                        {imagePreviewUrls.slice(0, 3).map((url, i) => (
+                          <img
+                            key={url}
+                            src={url}
+                            alt={stagedImageFiles[i]?.name ?? 'preview'}
+                            className="h-9 w-9 rounded border border-ink-500 object-cover"
+                          />
+                        ))}
+                        {stagedImageFiles.length > 3 && (
+                          <div className="flex h-9 w-9 items-center justify-center rounded border border-ink-500 bg-ink-700 text-[10px] text-muted">
+                            +{stagedImageFiles.length - 3}
+                          </div>
+                        )}
+                        <span className="ml-1 text-[10px] text-muted">
+                          {stagedImageFiles.length} image{stagedImageFiles.length > 1 ? 's' : ''}
+                        </span>
+                      </div>
+                    )}
+                    <XIcon
+                      size={12}
+                      className="ml-auto shrink-0 cursor-pointer text-muted hover:text-signal-danger"
+                      onClick={() => {
+                        setStagedWordFile(null);
+                        setStagedImageFiles([]);
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+              <div className="pointer-events-none absolute right-0 top-1/2 h-8 w-px -translate-y-1/2 bg-gradient-to-b from-transparent via-ink-500 to-transparent" />
+            </div>
+
             <RibbonGroup title="Analyze">
               <RibbonButton
                 icon={GitCompare}

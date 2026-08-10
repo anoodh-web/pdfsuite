@@ -473,6 +473,9 @@ interface DocumentState {
   setPendingCrop: (
     crop: { docId: string; page: number; x: number; y: number; w: number; h: number } | null
   ) => void;
+  toast: { message: string; kind: 'success' | 'error' } | null;
+  showToast: (message: string, kind?: 'success' | 'error') => void;
+  dismissToast: () => void;
   undoStack: HistoryEntry[];
   redoStack: HistoryEntry[];
   ocrText: Record<string, Record<number, OcrWord[]>>;
@@ -655,6 +658,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   textFontSize: 14,
   textFontFamily: 'Helvetica',
   pendingCrop: null,
+  toast: null,
   undoStack: [],
   redoStack: [],
   ocrText: {},
@@ -1068,9 +1072,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
     const outBytes = await newDoc.save();
     const proxy = await bytesToProxy(outBytes);
+    const newName = `${file.name.replace(/\.(png|jpe?g)$/i, '')}.pdf`;
     const doc: OpenDocument = {
       id: `${file.name}-${Date.now()}`,
-      name: `${file.name.replace(/\.(png|jpe?g)$/i, '')}.pdf`,
+      name: newName,
       pdfLibDoc: newDoc,
       proxy,
       pageCount: proxy.numPages,
@@ -1082,6 +1087,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       currentPage: 1,
       annotations: { ...s.annotations, [doc.id]: {} },
     }));
+    downloadBlob(outBytes, newName);
   },
 
   createPdfFromImages: async (files) => {
@@ -1100,9 +1106,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
     const outBytes = await newDoc.save();
     const proxy = await bytesToProxy(outBytes);
+    const newName = `Images (${newDoc.getPageCount()} pages).pdf`;
     const doc: OpenDocument = {
       id: `images-${Date.now()}`,
-      name: `Images (${newDoc.getPageCount()} pages).pdf`,
+      name: newName,
       pdfLibDoc: newDoc,
       proxy,
       pageCount: proxy.numPages,
@@ -1114,6 +1121,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       currentPage: 1,
       annotations: { ...s.annotations, [doc.id]: {} },
     }));
+    downloadBlob(outBytes, newName);
   },
 
   // Real image recompression, not a gimmick: most oversized PDFs are large
@@ -1284,6 +1292,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
         currentPage: 1,
         annotations: { ...s.annotations, [doc.id]: {} },
       }));
+      // this was the actual bug: the converted PDF was only ever opened as
+      // an in-app tab, never written to disk — despite the success message
+      // implying it had been saved. Downloading it here is what makes that
+      // message true, and matches how the PDF -> Word/PNG direction already behaves.
+      downloadBlob(outBytes, newName);
       return { ok: true };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -1438,6 +1451,19 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   setPendingCrop: (crop) => set({ pendingCrop: crop }),
+
+  showToast: (message, kind = 'success') => {
+    set({ toast: { message, kind } });
+    // auto-dismiss after a few seconds — errors stay a bit longer since
+    // they usually need actual reading, not just a glance
+    const duration = kind === 'error' ? 6000 : 3500;
+    setTimeout(() => {
+      // only clear if this is still the same toast (a newer one hasn't replaced it)
+      set((s) => (s.toast?.message === message ? { toast: null } : {}));
+    }, duration);
+  },
+
+  dismissToast: () => set({ toast: null }),
 
   // Real PDF cropping via the standard CropBox concept (not a rasterize
   // trick) — content outside the crop rectangle is still technically in
