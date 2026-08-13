@@ -66,7 +66,10 @@ export type TextFontFamily =
   | 'Courier'
   | 'Display'
   | 'Handwriting'
-  | 'Condensed';
+  | 'Condensed'
+  | 'Poppins'
+  | 'Montserrat'
+  | 'Roboto';
 
 export interface TextBoxAnnotation extends BaseAnnotation {
   type: 'text';
@@ -75,6 +78,9 @@ export interface TextBoxAnnotation extends BaseAnnotation {
   text: string;
   fontSize: number; // real point size (e.g. 14 = 14pt), not a display multiplier
   fontFamily?: TextFontFamily;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
   bgColor?: string; // set via the Bucket Fill tool
 }
 
@@ -224,6 +230,18 @@ interface TextLine {
   right: number; // right edge, PDF points
   y: number; // baseline, PDF points
   fontSize: number;
+  color: string; // best-effort detected fill color, hex
+  fontFamily: TextFontFamily; // best-effort category, mapped to our closest embeddable equivalent
+  bold: boolean; // detected via the font's real base name (e.g. "Helvetica-Bold")
+  italic: boolean; // detected the same way (e.g. "Helvetica-Italic")
+}
+
+export interface LineStyleOverride {
+  fontFamily: TextFontFamily;
+  fontSize: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
 }
 
 export interface CachedLine {
@@ -238,6 +256,10 @@ export interface CachedLine {
   baselinePt: number;
   leftPt: number;
   fontSizePt: number;
+  color: string; // best-effort detected original fill color, hex
+  fontFamily: TextFontFamily; // best-effort category match, not the exact original typeface
+  bold: boolean; // detected original weight
+  italic: boolean; // detected original slant
 }
 
 function multiplyMatrix(m1: number[], m2: number[]): number[] {
@@ -251,10 +273,115 @@ function multiplyMatrix(m1: number[], m2: number[]): number[] {
   ];
 }
 
+// Best-effort per-line color detection: pdf.js's getTextContent() doesn't
+// expose fill color directly, so this walks the raw operator list —
+// tracking the current fill color through save/restore and color-setting
+// ops — and records the color in effect at each text-draw operation, in
+// stream order. That order is then matched positionally against
+// getTextContent's items (which are built from the same stream, in the
+// same order), giving each text item a color without needing to
+// reconstruct exact glyph positions. This is genuinely best-effort: text
+// colored via a Pattern or Separation colorspace (rare in ordinary
+// documents) isn't resolved and falls back to black, and any place the
+// two orderings diverge could mis-attribute a color to a neighboring
+// item — acceptable for "detect and reuse the existing color when
+// editing," not something to rely on for exact reproduction.
+async function extractFillColorsInOrder(
+  page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>
+): Promise<string[]> {
+  const colors: string[] = [];
+  try {
+    const opList = await page.getOperatorList();
+    const OPS = pdfjsLib.OPS;
+    let fillColor = '#000000';
+
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      const fn = opList.fnArray[i];
+      const args = opList.argsArray[i] as unknown[];
+      if (
+        fn === OPS.setFillRGBColor ||
+        fn === OPS.setFillGray ||
+        fn === OPS.setFillCMYKColor ||
+        fn === OPS.setFillColor
+      ) {
+        // pdf.js's operator list already pre-formats every fill-color op
+        // into a ready CSS hex string in args[0] (verified directly
+        // against pdf.js's actual output, not assumed) — a Pattern or
+        // Separation colorspace is the one case that won't produce a
+        // parseable hex string here, in which case the previous color is
+        // simply kept rather than guessing.
+        if (typeof args?.[0] === 'string' && args[0].startsWith('#')) {
+          fillColor = args[0];
+        }
+      } else if (
+        fn === OPS.showText ||
+        fn === OPS.showSpacedText ||
+        fn === OPS.nextLineShowText ||
+        fn === OPS.nextLineSetSpacingShowText
+      ) {
+        colors.push(fillColor);
+      }
+    }
+  } catch {
+    // if this fails for any reason, every line just falls back to black
+  }
+  return colors;
+}
+
 async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>): Promise<TextLine[]> {
   const textContent = await page.getTextContent();
-  type Item = { str: string; transform: number[]; width: number; height: number };
+  const colorSamples = await extractFillColorsInOrder(page);
+  type Item = { str: string; transform: number[]; width: number; height: number; fontName?: string };
+  const styles = (textContent.styles ?? {}) as Record<string, { fontFamily?: string }>;
+
+  // pdf.js only exposes a coarse CSS category here (sans-serif / serif /
+  // monospace / cursive), not the document's actual embedded font — this
+  // maps that category to the closest of our own embeddable families, so
+  // editing a serif document defaults new/edited text to a serif font
+  // instead of always falling back to Helvetica. It is not, and cannot
+  // be, exact-typeface matching.
+  const mapFontCategory = (fontName: string | undefined): TextFontFamily => {
+    const family = fontName ? styles[fontName]?.fontFamily ?? '' : '';
+    if (family.includes('serif') && !family.includes('sans-serif')) return 'TimesRoman';
+    if (family.includes('monospace')) return 'Courier';
+    return 'Helvetica';
+  };
+
+  // Bold detection: pdf.js's getTextContent()/styles API doesn't expose a
+  // weight flag, but the loaded font object (available via commonObjs,
+  // keyed by the same fontName each text item references) does have the
+  // font's real base name — e.g. "Helvetica-Bold" — which reliably
+  // contains "Bold" for the overwhelming majority of real PDFs, since
+  // that's standard PDF/PostScript font-naming convention. Verified
+  // directly against a real generated PDF before relying on it.
+  const boldFontNames = new Set<string>();
+  const italicFontNames = new Set<string>();
+  for (const fontName of Object.keys(styles)) {
+    try {
+      const fontObj = page.commonObjs.get(fontName) as { name?: string } | undefined;
+      const baseName = (fontObj?.name ?? '').toLowerCase();
+      if (/bold|black|heavy|semibold|extrabold/.test(baseName)) {
+        boldFontNames.add(fontName);
+      }
+      if (/italic|oblique/.test(baseName)) {
+        italicFontNames.add(fontName);
+      }
+    } catch {
+      // font object not resolvable synchronously — leave undetected (falls back to not-bold/not-italic)
+    }
+  }
+
   const items = (textContent.items as Item[]).filter((it) => it.str !== undefined);
+  const itemColor = new Map<Item, string>();
+  // pdf.js's getTextContent() inserts synthetic empty-string "end of line"
+  // marker items that don't correspond to an actual showText call in the
+  // operator list — verified directly (a 4-line, 4-color test produced 5
+  // items, with the extra one being an empty hasEOL marker). Excluding
+  // those before zipping against colorSamples is what keeps the two
+  // sequences aligned; without it, every color after the first line ends
+  // up shifted onto the wrong text.
+  const drawableItems = items.filter((it) => it.str !== '');
+  drawableItems.forEach((it, i) => itemColor.set(it, colorSamples[i] ?? '#000000'));
 
   // group into lines by baseline proximity
   const lines: { y: number; parts: Item[] }[] = [];
@@ -278,6 +405,10 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
     let minX = Infinity;
     let maxRight = -Infinity;
     let sizeSum = 0;
+    const colorCounts = new Map<string, number>();
+    const familyCounts = new Map<TextFontFamily, number>();
+    let boldParts = 0;
+    let italicParts = 0;
     for (const part of line.parts) {
       const x = part.transform[4];
       const size = Math.hypot(part.transform[0], part.transform[1]) || 10;
@@ -291,13 +422,43 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
       minX = Math.min(minX, x);
       maxRight = Math.max(maxRight, x + part.width);
       sizeSum += size;
+      const c = itemColor.get(part) ?? '#000000';
+      colorCounts.set(c, (colorCounts.get(c) ?? 0) + 1);
+      const fam = mapFontCategory(part.fontName);
+      familyCounts.set(fam, (familyCounts.get(fam) ?? 0) + 1);
+      if (part.fontName && boldFontNames.has(part.fontName)) boldParts++;
+      if (part.fontName && italicFontNames.has(part.fontName)) italicParts++;
     }
+    let color = '#000000';
+    let bestColorCount = 0;
+    for (const [c, count] of colorCounts) {
+      if (count > bestColorCount) {
+        bestColorCount = count;
+        color = c;
+      }
+    }
+    let fontFamily: TextFontFamily = 'Helvetica';
+    let bestFamilyCount = 0;
+    for (const [fam, count] of familyCounts) {
+      if (count > bestFamilyCount) {
+        bestFamilyCount = count;
+        fontFamily = fam;
+      }
+    }
+    // majority vote, same as color/family — a line is "bold"/"italic" if
+    // most of its characters were drawn with a bold/italic-named font
+    const bold = boldParts > line.parts.length / 2;
+    const italic = italicParts > line.parts.length / 2;
     return {
       text,
       x: minX,
       right: maxRight,
       y: line.y,
+      bold,
+      italic,
       fontSize: sizeSum / line.parts.length,
+      color,
+      fontFamily,
     };
   });
 }
@@ -423,10 +584,35 @@ async function extractPageImages(
 // Custom (non-standard) font files, served from /public/fonts and used both
 // for on-screen preview (via @font-face in index.css) and for real PDF
 // embedding here, so what you see while typing matches the export exactly.
-const CUSTOM_FONT_FILES: Partial<Record<TextFontFamily, string>> = {
-  Display: '/fonts/PlayfairDisplay.ttf',
-  Handwriting: '/fonts/GochiHand.ttf',
-  Condensed: '/fonts/Oswald.ttf',
+// Display/Handwriting/Condensed only have a Regular file — Bold/Italic
+// toggles still work on-screen (the browser synthesizes them visually
+// for any font), but the exported PDF for those three specifically will
+// render at Regular weight/style regardless, since no genuine bold or
+// italic glyph outlines exist to embed. Poppins/Montserrat/Roboto have
+// real Bold and Italic files (no combined Bold-Italic file was sourced,
+// so both-at-once falls back to the Bold face).
+const CUSTOM_FONT_FILES: Record<
+  string,
+  { regular: string; bold?: string; italic?: string }
+> = {
+  Display: { regular: '/fonts/PlayfairDisplay.ttf' },
+  Handwriting: { regular: '/fonts/GochiHand.ttf' },
+  Condensed: { regular: '/fonts/Oswald.ttf' },
+  Poppins: {
+    regular: '/fonts/Poppins-Regular.ttf',
+    bold: '/fonts/Poppins-Bold.ttf',
+    italic: '/fonts/Poppins-Italic.ttf',
+  },
+  Montserrat: {
+    regular: '/fonts/Montserrat-Regular.ttf',
+    bold: '/fonts/Montserrat-Bold.ttf',
+    italic: '/fonts/Montserrat-Italic.ttf',
+  },
+  Roboto: {
+    regular: '/fonts/Roboto-Regular.ttf',
+    bold: '/fonts/Roboto-Bold.ttf',
+    italic: '/fonts/Roboto-Italic.ttf',
+  },
 };
 const fontByteCache = new Map<string, ArrayBuffer>();
 async function fetchFontBytes(url: string): Promise<ArrayBuffer> {
@@ -469,6 +655,9 @@ interface DocumentState {
   recentColors: string[];
   textFontSize: number;
   textFontFamily: TextFontFamily;
+  textBold: boolean;
+  textItalic: boolean;
+  textUnderline: boolean;
   pendingCrop: { docId: string; page: number; x: number; y: number; w: number; h: number } | null;
   setPendingCrop: (
     crop: { docId: string; page: number; x: number; y: number; w: number; h: number } | null
@@ -476,6 +665,12 @@ interface DocumentState {
   toast: { message: string; kind: 'success' | 'error' } | null;
   showToast: (message: string, kind?: 'success' | 'error') => void;
   dismissToast: () => void;
+  // whichever text box is currently open for editing on the canvas, if
+  // any — lets ribbon controls (font family/size/bold/italic/underline)
+  // apply live to it, instead of only setting the default for new text
+  activeTextBox: { docId: string; page: number; id: string } | null;
+  setActiveTextBox: (box: { docId: string; page: number; id: string } | null) => void;
+  setTextBoxFontFamily: (docId: string, page: number, id: string, family: TextFontFamily) => void;
   undoStack: HistoryEntry[];
   redoStack: HistoryEntry[];
   ocrText: Record<string, Record<number, OcrWord[]>>;
@@ -491,6 +686,24 @@ interface DocumentState {
   formFields: Record<string, DetectedFormField[]>;
   pageLines: Record<string, Record<number, CachedLine[]>>;
   lineEdits: Record<string, Record<number, Record<number, string>>>;
+  // manual overrides on top of the detected style for a line — lets a
+  // user change font family/size/bold/italic/underline on existing PDF
+  // text, same as they can for a new Type Text box
+  lineStyleOverrides: Record<
+    string,
+    Record<number, Record<number, Partial<LineStyleOverride>>>
+  >;
+  setLineStyleOverride: (
+    docId: string,
+    page: number,
+    lineIndex: number,
+    patch: Partial<LineStyleOverride>
+  ) => void;
+  // whichever line is currently open for editing, if any — lets ribbon
+  // controls (font family/size/bold/italic/underline) apply live to it,
+  // the same way activeTextBox does for Type Text boxes
+  activeEditLine: { docId: string; page: number; lineIndex: number } | null;
+  setActiveEditLine: (line: { docId: string; page: number; lineIndex: number } | null) => void;
 
   openFile: (file: File) => Promise<void>;
   closeDocument: (id: string) => void;
@@ -504,6 +717,15 @@ interface DocumentState {
   setAnnotationColor: (color: string) => void;
   setTextFontSize: (size: number) => void;
   setTextFontFamily: (family: TextFontFamily) => void;
+  setTextBold: (bold: boolean) => void;
+  setTextItalic: (italic: boolean) => void;
+  setTextUnderline: (underline: boolean) => void;
+  toggleTextBoxStyle: (
+    docId: string,
+    page: number,
+    id: string,
+    style: 'bold' | 'italic' | 'underline'
+  ) => void;
   setTextBoxFontSize: (docId: string, page: number, id: string, size: number) => void;
   setTextBoxBackground: (docId: string, page: number, id: string, color: string | null) => void;
 
@@ -522,6 +744,7 @@ interface DocumentState {
   updateTextBoxText: (docId: string, page: number, id: string, text: string) => void;
   updateTextBoxPosition: (docId: string, page: number, id: string, x: number, y: number) => void;
   updateImagePosition: (docId: string, page: number, id: string, x: number, y: number) => void;
+  updateNotePosition: (docId: string, page: number, id: string, x: number, y: number) => void;
   finalizeSignature: (
     docId: string,
     page: number,
@@ -583,6 +806,7 @@ interface DocumentState {
     w: number,
     h: number
   ) => Promise<void>;
+  deleteFormField: (docId: string, fieldName: string) => Promise<void>;
   flattenForm: (docId: string) => Promise<void>;
   loadPageLines: (docId: string, pageNum: number) => Promise<void>;
   setLineEdit: (docId: string, page: number, lineIndex: number, text: string) => void;
@@ -657,8 +881,12 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   recentColors: [],
   textFontSize: 14,
   textFontFamily: 'Helvetica',
+  textBold: false,
+  textItalic: false,
+  textUnderline: false,
   pendingCrop: null,
   toast: null,
+  activeTextBox: null,
   undoStack: [],
   redoStack: [],
   ocrText: {},
@@ -671,6 +899,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   formFields: {},
   pageLines: {},
   lineEdits: {},
+  lineStyleOverrides: {},
+  activeEditLine: null,
 
   openFile: async (file: File) => {
     const buf = new Uint8Array(await file.arrayBuffer());
@@ -965,6 +1195,32 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const dd = pdfForm.createDropdown(uniqueName);
       dd.addOptions(['Option A', 'Option B', 'Option C']);
       dd.addToPage(pdfPage, { x, y, width: w, height: h, borderWidth: 1 });
+    }
+
+    const bytes = await doc.pdfLibDoc.save();
+    const proxy = await bytesToProxy(bytes);
+    set((s) => ({
+      documents: s.documents.map((d) =>
+        d.id === docId ? { ...d, proxy, pageCount: proxy.numPages } : d
+      ),
+    }));
+    await get().loadFormFields(docId);
+  },
+
+  // Real field removal via pdf-lib's own PDFForm API (removes the field
+  // and every widget/appearance tied to it), not just hiding it from the
+  // list — this is what "cannot be deleted" was actually missing, since
+  // no delete action existed for form fields at all before this.
+  deleteFormField: async (docId, fieldName) => {
+    const doc = get().documents.find((d) => d.id === docId);
+    if (!doc) return;
+    try {
+      const pdfForm = doc.pdfLibDoc.getForm();
+      const field = pdfForm.getField(fieldName);
+      pdfForm.removeField(field);
+    } catch (e) {
+      console.warn('Could not remove form field:', e);
+      return;
     }
 
     const bytes = await doc.pdfLibDoc.save();
@@ -1518,6 +1774,32 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
   setTextFontSize: (size) => set({ textFontSize: Math.max(6, Math.min(144, size)) }),
   setTextFontFamily: (family) => set({ textFontFamily: family }),
+  setTextBold: (bold) => set({ textBold: bold }),
+  setTextItalic: (italic) => set({ textItalic: italic }),
+  setTextUnderline: (underline) => set({ textUnderline: underline }),
+
+  toggleTextBoxStyle: (docId, page, id, style) => {
+    const { annotations } = get();
+    const docAnns = { ...(annotations[docId] ?? {}) };
+    docAnns[page] = (docAnns[page] ?? []).map((a) => {
+      if (a.id !== id || a.type !== 'text') return a;
+      if (style === 'bold') return { ...a, bold: !a.bold };
+      if (style === 'italic') return { ...a, italic: !a.italic };
+      return { ...a, underline: !a.underline };
+    });
+    set({ annotations: { ...annotations, [docId]: docAnns } });
+  },
+
+  setActiveTextBox: (box) => set({ activeTextBox: box }),
+
+  setTextBoxFontFamily: (docId, page, id, family) => {
+    const { annotations } = get();
+    const docAnns = { ...(annotations[docId] ?? {}) };
+    docAnns[page] = (docAnns[page] ?? []).map((a) =>
+      a.id === id && a.type === 'text' ? { ...a, fontFamily: family } : a
+    );
+    set({ annotations: { ...annotations, [docId]: docAnns } });
+  },
 
   setTextBoxFontSize: (docId, page, id, size) => {
     const { annotations } = get();
@@ -1650,33 +1932,74 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const exportDoc = await PDFDocument.load(structuralBytes);
     exportDoc.registerFontkit(fontkit); // needed to embed the custom (non-standard) font families
     const font = await exportDoc.embedFont(StandardFonts.Helvetica);
-    const fontVariants: Partial<Record<TextFontFamily, PDFFont>> = {
-      Helvetica: font,
-      TimesRoman: await exportDoc.embedFont(StandardFonts.TimesRoman),
-      Courier: await exportDoc.embedFont(StandardFonts.Courier),
-    };
 
-    // only fetch/embed a custom font if some text annotation on this
-    // document actually uses it — no point paying the cost otherwise
-    const usedFamilies = new Set<TextFontFamily>();
+    // Every family+bold+italic combination actually used, gathered up front
+    // so each font file/StandardFont variant is only embedded once.
+    const usedCombos = new Set<string>();
     for (const pageAnns of Object.values(get().annotations[docId] ?? {})) {
       for (const a of pageAnns) {
-        if (a.type === 'text' && a.fontFamily) usedFamilies.add(a.fontFamily);
+        if (a.type === 'text') {
+          usedCombos.add(`${a.fontFamily ?? 'Helvetica'}|${!!a.bold}|${!!a.italic}`);
+        }
       }
     }
-    for (const family of usedFamilies) {
-      const fileUrl = CUSTOM_FONT_FILES[family];
-      if (!fileUrl || fontVariants[family]) continue;
+
+    const fontCache = new Map<string, PDFFont>();
+    const STANDARD_VARIANTS: Record<string, Record<string, StandardFonts>> = {
+      Helvetica: {
+        '00': StandardFonts.Helvetica,
+        '10': StandardFonts.HelveticaBold,
+        '01': StandardFonts.HelveticaOblique,
+        '11': StandardFonts.HelveticaBoldOblique,
+      },
+      TimesRoman: {
+        '00': StandardFonts.TimesRoman,
+        '10': StandardFonts.TimesRomanBold,
+        '01': StandardFonts.TimesRomanItalic,
+        '11': StandardFonts.TimesRomanBoldItalic,
+      },
+      Courier: {
+        '00': StandardFonts.Courier,
+        '10': StandardFonts.CourierBold,
+        '01': StandardFonts.CourierOblique,
+        '11': StandardFonts.CourierBoldOblique,
+      },
+    };
+
+    for (const combo of usedCombos) {
+      const [family, boldStr, italicStr] = combo.split('|');
+      const bold = boldStr === 'true';
+      const italic = italicStr === 'true';
+      const key = `${bold ? '1' : '0'}${italic ? '1' : '0'}`;
+
+      if (STANDARD_VARIANTS[family]) {
+        try {
+          fontCache.set(combo, await exportDoc.embedFont(STANDARD_VARIANTS[family][key]));
+        } catch (e) {
+          console.warn(`Could not embed ${family} (bold=${bold}, italic=${italic}):`, e);
+        }
+        continue;
+      }
+
+      const files = CUSTOM_FONT_FILES[family];
+      if (!files) continue;
+      // no combined bold-italic file was sourced for these — bold wins if both are on
+      const fileUrl = bold ? files.bold ?? files.regular : italic ? files.italic ?? files.regular : files.regular;
       try {
         const bytes = await fetchFontBytes(fileUrl);
-        // subset:false — these particular variable-font files trip up
-        // fontkit's subsetter (verified independently before shipping this);
+        // subset:false — these particular font files trip up fontkit's
+        // subsetter (verified independently before shipping this);
         // embedding the full font avoids that at the cost of a larger file
-        fontVariants[family] = await exportDoc.embedFont(bytes, { subset: false });
+        fontCache.set(combo, await exportDoc.embedFont(bytes, { subset: false }));
       } catch (e) {
         console.warn(`Could not embed the "${family}" font, falling back to Helvetica:`, e);
       }
     }
+
+    const resolveTextFont = (a: TextBoxAnnotation): PDFFont => {
+      const combo = `${a.fontFamily ?? 'Helvetica'}|${!!a.bold}|${!!a.italic}`;
+      return fontCache.get(combo) ?? font;
+    };
 
     const docAnnotations = get().annotations[docId] ?? {};
     for (const pageNumStr of Object.keys(docAnnotations)) {
@@ -1709,9 +2032,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           }
         } else if (a.type === 'text') {
           const fontSize = a.fontSize; // already real points
-          const textFont = fontVariants[a.fontFamily ?? 'Helvetica'] ?? font;
+          const textFont = resolveTextFont(a);
+          const textWidth = textFont.widthOfTextAtSize(a.text || ' ', fontSize);
           if (a.bgColor) {
-            const textWidth = textFont.widthOfTextAtSize(a.text || ' ', fontSize);
             page.drawRectangle({
               x: a.x * width - 2,
               y: height - a.y * height - fontSize * 1.15,
@@ -1727,6 +2050,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
             font: textFont,
             color,
           });
+          if (a.underline && a.text) {
+            const underlineY = height - a.y * height - fontSize - fontSize * 0.08;
+            page.drawLine({
+              start: { x: a.x * width, y: underlineY },
+              end: { x: a.x * width + textWidth, y: underlineY },
+              thickness: Math.max(0.75, fontSize * 0.05),
+              color,
+            });
+          }
         } else if (a.type === 'note') {
           const cx = a.x * width;
           const cy = height - a.y * height;
@@ -2179,6 +2511,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const docAnns = get().annotations[docId] ?? {};
     const docLineEdits = get().lineEdits[docId] ?? {};
     const docLines = get().pageLines[docId] ?? {};
+    const docStyleOverrides = get().lineStyleOverrides[docId] ?? {};
 
     const redactionPages = Object.keys(docAnns)
       .map(Number)
@@ -2186,7 +2519,12 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const lineEditPages = Object.keys(docLineEdits)
       .map(Number)
       .filter((p) => Object.keys(docLineEdits[p] ?? {}).length > 0);
-    const pagesToFlatten = Array.from(new Set([...redactionPages, ...lineEditPages]));
+    const styleOverridePages = Object.keys(docStyleOverrides)
+      .map(Number)
+      .filter((p) => Object.keys(docStyleOverrides[p] ?? {}).length > 0);
+    const pagesToFlatten = Array.from(
+      new Set([...redactionPages, ...lineEditPages, ...styleOverridePages])
+    );
     if (pagesToFlatten.length === 0) return;
 
     set({ ocrProgress: { active: true, label: 'Applying changes', pct: 0 } });
@@ -2200,8 +2538,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
         (a): a is RedactionAnnotation => a.type === 'redact' && !a.applied
       );
       const editsHere = docLineEdits[pageNum] ?? {};
+      const styleOverridesHere = docStyleOverrides[pageNum] ?? {};
       const linesHere = docLines[pageNum] ?? [];
-      const hasEdits = Object.keys(editsHere).length > 0;
+      const hasEdits = Object.keys(editsHere).length > 0 || Object.keys(styleOverridesHere).length > 0;
 
       if (redactionsHere.length === 0 && !hasEdits) {
         // untouched page: copy as-is, no quality/text loss
@@ -2225,20 +2564,48 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
         for (const r of redactionsHere) {
           ctx.fillStyle = r.color || '#000000';
-          ctx.fillRect(
-            r.x * viewport.width,
-            r.y * viewport.height,
-            r.w * viewport.width,
-            r.h * viewport.height
-          );
+          // Snap to whole device pixels with a 1px safety margin on every
+          // side. My earlier fix added a fixed sub-pixel padding, which
+          // doesn't actually guarantee anything — padding a fractional
+          // coordinate can still land on a fraction. Floor/ceil is the
+          // real guarantee: the fill always fully covers every pixel the
+          // erased area touches, with no fractional edge left for the
+          // canvas to anti-alias into a visible sliver of the original
+          // content.
+          const x0 = Math.floor(r.x * viewport.width) - 1;
+          const y0 = Math.floor(r.y * viewport.height) - 1;
+          const x1 = Math.ceil((r.x + r.w) * viewport.width) + 1;
+          const y1 = Math.ceil((r.y + r.h) * viewport.height) + 1;
+          ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
         }
 
-        for (const idxStr of Object.keys(editsHere)) {
-          const idx = Number(idxStr);
+        const lineIndicesToBake = new Set([
+          ...Object.keys(editsHere).map(Number),
+          ...Object.keys(styleOverridesHere).map(Number),
+        ]);
+
+        for (const idx of lineIndicesToBake) {
           const line = linesHere[idx];
           if (!line) continue;
-          const newText = editsHere[idx];
-          if (newText === line.text) continue;
+          const override = styleOverridesHere[idx];
+          const newText = editsHere[idx] ?? line.text;
+          const effectiveFamily = override?.fontFamily ?? line.fontFamily;
+          const effectiveBold = override?.bold ?? line.bold;
+          const effectiveItalic = override?.italic ?? line.italic;
+          const effectiveUnderline = override?.underline ?? false;
+          const effectiveFontSizePt = override?.fontSize ?? line.fontSizePt;
+          // if nothing actually changed (no text edit, no real style
+          // override applied), skip re-baking this line at all
+          if (
+            newText === line.text &&
+            !override?.fontFamily &&
+            !override?.fontSize &&
+            override?.bold === undefined &&
+            override?.italic === undefined &&
+            !override?.underline
+          ) {
+            continue;
+          }
 
           const px = line.x * viewport.width;
           const py = line.yTop * viewport.height;
@@ -2247,11 +2614,42 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           ctx.fillStyle = '#FFFFFF';
           ctx.fillRect(px - 2, py - 2, pw + 4, ph + 4);
           if (newText.trim()) {
-            const fontPx = (ph / 1.3) * 0.92;
-            ctx.fillStyle = '#000000';
-            ctx.font = `${fontPx}px Helvetica, Arial, sans-serif`;
+            // font size scales with the line's own detected box height by
+            // default, but an explicit override (in real points) takes
+            // priority and is converted using the same points-per-device-
+            // pixel ratio as the rest of this render
+            const fontPx = override?.fontSize
+              ? effectiveFontSizePt * scale
+              : (ph / 1.3) * 0.92;
+            ctx.fillStyle = line.color || '#000000';
+            const canvasFontStack =
+              effectiveFamily === 'TimesRoman'
+                ? '"Times New Roman", Times, serif'
+                : effectiveFamily === 'Courier'
+                ? '"Courier New", Courier, monospace'
+                : effectiveFamily === 'Poppins'
+                ? '"PDFSuite Poppins", Arial, sans-serif'
+                : effectiveFamily === 'Montserrat'
+                ? '"PDFSuite Montserrat", Arial, sans-serif'
+                : effectiveFamily === 'Roboto'
+                ? '"PDFSuite Roboto", Arial, sans-serif'
+                : 'Helvetica, Arial, sans-serif';
+            const weightPrefix = effectiveBold ? 'bold ' : '';
+            const stylePrefix = effectiveItalic ? 'italic ' : '';
+            ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
             ctx.textBaseline = 'alphabetic';
-            ctx.fillText(newText, px, py + ph * 0.82);
+            const textY = py + ph * 0.82;
+            ctx.fillText(newText, px, textY);
+            if (effectiveUnderline) {
+              const textWidth = ctx.measureText(newText).width;
+              ctx.strokeStyle = line.color || '#000000';
+              ctx.lineWidth = Math.max(1, fontPx * 0.05);
+              ctx.beginPath();
+              const underlineY = textY + fontPx * 0.08;
+              ctx.moveTo(px, underlineY);
+              ctx.lineTo(px + textWidth, underlineY);
+              ctx.stroke();
+            }
           }
         }
 
@@ -2372,6 +2770,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     set({ annotations: { ...annotations, [docId]: docAnns } });
   },
 
+  updateNotePosition: (docId, page, id, x, y) => {
+    const { annotations } = get();
+    const docAnns = { ...(annotations[docId] ?? {}) };
+    docAnns[page] = (docAnns[page] ?? []).map((a) =>
+      a.id === id && a.type === 'note' ? { ...a, x, y } : a
+    );
+    set({ annotations: { ...annotations, [docId]: docAnns } });
+  },
+
   finalizeSignature: (docId, page, id, dataUrl, w, h) => {
     const { annotations } = get();
     const docAnns = { ...(annotations[docId] ?? {}) };
@@ -2443,6 +2850,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           baselinePt: l.y,
           leftPt: l.x,
           fontSizePt: l.fontSize,
+          color: l.color,
+          fontFamily: l.fontFamily,
+          bold: l.bold,
+          italic: l.italic,
         };
       });
 
@@ -2488,6 +2899,17 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     docEdits[page] = { ...(docEdits[page] ?? {}), [lineIndex]: text };
     set({ lineEdits: { ...lineEdits, [docId]: docEdits } });
   },
+
+  setLineStyleOverride: (docId, page, lineIndex, patch) => {
+    const { lineStyleOverrides } = get();
+    const docOverrides = { ...(lineStyleOverrides[docId] ?? {}) };
+    const pageOverrides = { ...(docOverrides[page] ?? {}) };
+    pageOverrides[lineIndex] = { ...(pageOverrides[lineIndex] ?? {}), ...patch };
+    docOverrides[page] = pageOverrides;
+    set({ lineStyleOverrides: { ...lineStyleOverrides, [docId]: docOverrides } });
+  },
+
+  setActiveEditLine: (line) => set({ activeEditLine: line }),
 
   undo: () => {
     const { undoStack, redoStack, annotations, lineEdits } = get();

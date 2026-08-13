@@ -17,9 +17,9 @@ export default function OnboardingPrompt({ onDone }: { onDone: () => void }) {
     <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div className="w-96 rounded-lg border border-ink-500 bg-ink-800 shadow-2xl">
         <div className="flex flex-col items-center gap-3 border-b border-ink-600 px-6 py-6 text-center">
-          <img src="/logo-64.png" alt="PDF Suite" className="h-12 w-12" />
+          <img src="/logo-64.png" alt="PDF Suite Pro" className="h-12 w-12" />
           <div>
-            <div className="text-xl font-bold text-accent">Welcome to PDF Suite</div>
+            <div className="text-xl font-bold text-accent">Welcome to PDF Suite Pro</div>
             <p className="mt-1 text-xs text-muted">
               Let's get you set up — just your name and email to personalize the app.
             </p>

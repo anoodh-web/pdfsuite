@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "PDF Suite",
+  "productName": "PDF Suite Pro",
   "version": "1.2.11",
   "identifier": "com.adlabs.pdfsuite",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "PDF Suite",
+        "title": "PDF Suite Pro",
         "width": 1440,
         "height": 900,
         "minWidth": 960,
@@ -31,7 +31,7 @@
     "publisher": "AD Labs",
     "copyright": "Copyright (c) 2026 AD Labs",
     "shortDescription": "Enterprise PDF management suite",
-    "longDescription": "PDF Suite — view, edit, convert, secure, and sign PDF documents. Developed and engineered by AD Labs.",
+    "longDescription": "PDF Suite Pro — view, edit, convert, secure, and sign PDF documents. Developed and engineered by AD Labs.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

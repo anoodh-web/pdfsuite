@@ -67,8 +67,8 @@ export default function BackstageView({
     <div className="fixed inset-0 z-50 flex flex-col bg-ink-900">
       {/* branded header */}
       <div className="flex items-center gap-3 border-b border-ink-600 bg-ink-800 px-6 py-5">
-        <img src="/logo-128.png" alt="PDF Suite" className="h-12 w-12" />
-        <span className="font-ui text-3xl font-bold text-accent">PDF Suite</span>
+        <img src="/logo-128.png" alt="PDF Suite Pro" className="h-12 w-12" />
+        <span className="font-ui text-3xl font-bold text-accent">PDF Suite Pro</span>
       </div>
 
       <div className="flex flex-1 overflow-hidden">
@@ -281,9 +281,9 @@ export default function BackstageView({
           <div className="max-w-xl">
             <h1 className="mb-6 text-2xl font-semibold text-paper">About</h1>
             <div className="flex items-start gap-5 rounded-lg border border-ink-600 bg-ink-800 p-6">
-              <img src="/logo-256.png" alt="PDF Suite" className="h-20 w-20 shrink-0" />
+              <img src="/logo-256.png" alt="PDF Suite Pro" className="h-20 w-20 shrink-0" />
               <div>
-                <div className="text-xl font-bold text-accent">PDF Suite</div>
+                <div className="text-xl font-bold text-accent">PDF Suite Pro</div>
                 <div className="mb-3 text-xs text-muted">Version 1.2.11</div>
                 <div className="space-y-1 text-sm text-paper/80">
                   <div>Developed &amp; Engineered by AD Labs</div>

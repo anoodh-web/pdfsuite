@@ -9,6 +9,18 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+// Shared offscreen canvas for measuring rendered text width — used to let
+// the direct-line-editing box grow to fit whatever you've actually typed,
+// instead of staying clamped to the original line's detected width (which
+// was clipping/hiding any text appended past that original length).
+const measureCanvas = document.createElement('canvas');
+function measureTextWidthPx(text: string, fontPx: number, fontFamily: string): number {
+  const ctx = measureCanvas.getContext('2d');
+  if (!ctx) return 0;
+  ctx.font = `${fontPx}px ${fontFamily}`;
+  return ctx.measureText(text || ' ').width;
+}
+
 export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -23,6 +35,14 @@ export default function Canvas() {
     annotationColor,
     textFontSize,
     textFontFamily,
+    textBold,
+    textItalic,
+    textUnderline,
+    toggleTextBoxStyle,
+    setActiveTextBox,
+    lineStyleOverrides,
+    setLineStyleOverride,
+    setActiveEditLine,
     setTextBoxBackground,
     annotations,
     addAnnotation,
@@ -30,6 +50,7 @@ export default function Canvas() {
     updateTextBoxText,
     updateTextBoxPosition,
     updateImagePosition,
+    updateNotePosition,
     finalizeSignature,
     deleteAnnotation,
     ocrProgress,
@@ -39,6 +60,7 @@ export default function Canvas() {
     loadFormFields,
     setFormFieldValue,
     createFormField,
+    deleteFormField,
     pageLines,
     loadPageLines,
     lineEdits,
@@ -335,9 +357,13 @@ export default function Canvas() {
         text: '',
         fontSize: textFontSize,
         fontFamily: textFontFamily,
+        bold: textBold,
+        italic: textItalic,
+        underline: textUnderline,
       };
       addAnnotation(doc.id, box);
       setOpenTextId(box.id);
+      setActiveTextBox({ docId: doc.id, page: currentPage, id: box.id });
     } else if (activeTool === 'signature') {
       // placeholder image annotation; filled in once the user types a name
       const sig: Annotation = {
@@ -498,9 +524,18 @@ export default function Canvas() {
             ref={textLayerRef}
             className="textLayer"
             style={{
-              pointerEvents: activeTool === 'erase-text' ? 'auto' : 'none',
+              pointerEvents: activeTool === 'erase-text' || activeTool === 'select' ? 'auto' : 'none',
               width: pageSize.w,
               height: pageSize.h,
+            }}
+            onMouseUp={() => {
+              // With the Select tool, a plain click (no drag-selected text)
+              // on empty page space should clear whatever annotation was
+              // previously selected — mirroring what a click on empty
+              // overlay space already did for every other tool.
+              if (activeTool === 'select' && !window.getSelection()?.toString()) {
+                setSelectedAnnotationId(null);
+              }
             }}
           />
           <div
@@ -512,7 +547,13 @@ export default function Canvas() {
             style={{
               width: pageSize.w,
               height: pageSize.h,
-              pointerEvents: activeTool === 'erase-text' ? 'none' : 'auto',
+              // For Select and Select-Text-and-Delete, the real PDF text
+              // layer underneath needs to receive clicks/drags directly —
+              // this container itself steps out of the way so empty page
+              // space passes through to it, while every one of our own
+              // annotations below sets its own explicit pointer-events so
+              // it keeps working regardless of what this container is set to.
+              pointerEvents: activeTool === 'erase-text' || activeTool === 'select' ? 'none' : 'auto',
             }}
           >
             <svg className="pointer-events-none absolute inset-0 h-full w-full">
@@ -643,24 +684,65 @@ export default function Canvas() {
               <CropMarquee x={pendingCrop.x} y={pendingCrop.y} w={pendingCrop.w} h={pendingCrop.h} />
             )}
 
+            {/* Unapplied erase marks stay visible with a dashed border so a
+                pure-white mark doesn't just disappear into the white page —
+                but a border alone can look like a permanent flaw rather
+                than a provisional state. This label makes the "not done
+                yet, click Apply" meaning explicit rather than implied. */}
+            {pageAnnotations
+              .filter(
+                (a): a is Extract<Annotation, { type: 'redact' }> =>
+                  a.type === 'redact' && a.color === '#FFFFFF'
+              )
+              .map((a) => (
+                <div
+                  key={`pending-label-${a.id}`}
+                  className="pointer-events-none absolute whitespace-nowrap rounded bg-signal-danger px-1.5 py-0.5 text-[10px] font-medium text-white shadow"
+                  style={{
+                    left: `${a.x * 100}%`,
+                    top: `${a.y * 100}%`,
+                    transform: 'translateY(-100%)',
+                  }}
+                >
+                  Pending — click Apply on the Edit tab
+                </div>
+              ))}
             {pageAnnotations
               .filter((a) => a.type === 'note')
               .map((a) => (
                 <div
                   key={a.id}
-                  className="absolute"
+                  className="pointer-events-auto absolute"
                   style={{ left: `${a.x * 100}%`, top: `${a.y * 100}%` }}
                 >
                   <button
+                    draggable
                     onMouseDown={(e) => {
                       e.stopPropagation();
                       setSelectedAnnotationId(a.id);
                     }}
+                    onDragEnd={(e) => {
+                      if (e.clientX === 0 && e.clientY === 0) return; // dropped outside the page
+                      const rect = overlayRef.current!.getBoundingClientRect();
+                      const x = (e.clientX - rect.left) / rect.width;
+                      const y = (e.clientY - rect.top) / rect.height;
+                      updateNotePosition(
+                        doc.id,
+                        currentPage,
+                        a.id,
+                        Math.max(0, Math.min(1, x)),
+                        Math.max(0, Math.min(1, y))
+                      );
+                    }}
                     onClick={(e) => {
                       e.stopPropagation();
-                      setOpenNoteId(openNoteId === a.id ? null : a.id);
+                      if (activeTool === 'select') {
+                        setSelectedAnnotationId(a.id);
+                      } else {
+                        setOpenNoteId(openNoteId === a.id ? null : a.id);
+                      }
                     }}
-                    className="flex h-6 w-6 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-white/30 text-[11px] font-bold text-black shadow"
+                    className="flex h-6 w-6 -translate-x-1/2 -translate-y-1/2 cursor-move items-center justify-center rounded-full border border-white/30 text-[11px] font-bold text-black shadow"
                     style={{ background: a.color }}
                   >
                     !
@@ -717,7 +799,7 @@ export default function Canvas() {
                       Math.max(0, Math.min(0.95, y))
                     );
                   }}
-                  className="group absolute cursor-move"
+                  className="pointer-events-auto group absolute cursor-move"
                   style={{
                     left: `${a.x * 100}%`,
                     top: `${a.y * 100}%`,
@@ -739,33 +821,71 @@ export default function Canvas() {
                           color: a.color,
                           fontSize: `${a.fontSize * zoom * 1.4}px`,
                           fontFamily: FONT_FAMILY_CSS[a.fontFamily ?? 'Helvetica'],
+                          fontWeight: a.bold ? 'bold' : 'normal',
+                          fontStyle: a.italic ? 'italic' : 'normal',
+                          textDecoration: a.underline ? 'underline' : 'none',
                           background: a.bgColor ?? 'rgba(255,255,255,0.9)',
                         }}
                         className="min-h-[1.6em] w-40 cursor-text resize rounded border border-dashed border-accent p-1 leading-tight focus:outline-none"
                         placeholder="Type…"
                       />
-                      <X
-                        size={12}
-                        className="mt-1 cursor-pointer text-signal-danger"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          deleteAnnotation(doc.id, currentPage, a.id);
-                        }}
-                      />
+                      <div className="mt-1 flex flex-col gap-1">
+                        <div className="flex gap-0.5 rounded bg-ink-700 p-0.5">
+                          <button
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'bold')}
+                            className={`rounded px-1 text-[10px] font-bold ${a.bold ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                            title="Bold"
+                          >
+                            B
+                          </button>
+                          <button
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'italic')}
+                            className={`rounded px-1 text-[10px] italic ${a.italic ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                            title="Italic"
+                          >
+                            I
+                          </button>
+                          <button
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'underline')}
+                            className={`rounded px-1 text-[10px] underline ${a.underline ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                            title="Underline"
+                          >
+                            U
+                          </button>
+                        </div>
+                        <X
+                          size={12}
+                          className="mx-auto cursor-pointer text-signal-danger"
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            deleteAnnotation(doc.id, currentPage, a.id);
+                            setActiveTextBox(null);
+                          }}
+                        />
+                      </div>
                     </div>
                   ) : (
                     <span
                       onClick={() => {
                         if (activeTool === 'fill') {
                           setTextBoxBackground(doc.id, currentPage, a.id, annotationColor);
+                        } else if (activeTool === 'select') {
+                          setSelectedAnnotationId(a.id);
                         } else {
                           setOpenTextId(a.id);
+                          setActiveTextBox({ docId: doc.id, page: currentPage, id: a.id });
                         }
                       }}
                       style={{
                         color: a.color,
                         fontSize: `${a.fontSize * zoom * 1.4}px`,
                         fontFamily: FONT_FAMILY_CSS[a.fontFamily ?? 'Helvetica'],
+                        fontWeight: a.bold ? 'bold' : 'normal',
+                        fontStyle: a.italic ? 'italic' : 'normal',
+                        textDecoration: a.underline ? 'underline' : 'none',
                         background: a.bgColor,
                       }}
                       className={`whitespace-pre-wrap rounded px-0.5 leading-tight ring-0 group-hover:outline group-hover:outline-1 group-hover:outline-dashed group-hover:outline-accent ${
@@ -805,7 +925,7 @@ export default function Canvas() {
                       Math.max(0, Math.min(1 - a.h, y))
                     );
                   }}
-                  className="group absolute cursor-move border border-transparent hover:border-accent"
+                  className="pointer-events-auto group absolute cursor-move border border-transparent hover:border-accent"
                   style={{
                     left: `${a.x * 100}%`,
                     top: `${a.y * 100}%`,
@@ -826,7 +946,7 @@ export default function Canvas() {
                 <div
                   key={f.id}
                   onMouseDown={(e) => e.stopPropagation()}
-                  className="absolute"
+                  className="pointer-events-auto group absolute"
                   style={{
                     left: `${f.x * 100}%`,
                     top: `${f.y * 100}%`,
@@ -834,6 +954,13 @@ export default function Canvas() {
                     height: `${f.h * 100}%`,
                   }}
                 >
+                  <button
+                    onClick={() => deleteFormField(doc.id, f.fieldName)}
+                    title="Delete field"
+                    className="absolute -right-2 -top-2 z-10 flex h-4 w-4 items-center justify-center rounded-full bg-signal-danger text-white opacity-0 shadow group-hover:opacity-100"
+                  >
+                    <X size={10} />
+                  </button>
                   {f.kind === 'text' && (
                     <input
                       value={f.value}
@@ -880,11 +1007,24 @@ export default function Canvas() {
               ))}
 
             {(pageLines[doc.id]?.[currentPage] ?? []).map((line) => {
-              const override = lineEdits[doc.id]?.[currentPage]?.[line.index];
-              const hasOverride = override !== undefined && override !== line.text;
+              const textOverride = lineEdits[doc.id]?.[currentPage]?.[line.index];
+              const hasOverride = textOverride !== undefined && textOverride !== line.text;
               const isEditing = editingLineIndex === line.index;
-              const displayText = override ?? line.text;
-              const fontPx = Math.max(8, (line.h * pageSize.h) / 1.3);
+              const displayText = textOverride ?? line.text;
+              const styleOverride = lineStyleOverrides[doc.id]?.[currentPage]?.[line.index];
+              // effective style = whatever's been manually overridden,
+              // falling back to what was actually detected in the
+              // original PDF — this is what makes bold/italic/family
+              // survive an edit instead of silently reverting to defaults
+              const effFamily = styleOverride?.fontFamily ?? line.fontFamily;
+              const effSize = styleOverride?.fontSize;
+              const effBold = styleOverride?.bold ?? line.bold;
+              const effItalic = styleOverride?.italic ?? line.italic;
+              const effUnderline = styleOverride?.underline ?? false;
+              const fontPx = effSize
+                ? effSize * zoom * 1.4
+                : Math.max(8, (line.h * pageSize.h) / 1.3);
+              const fontFamilyCss = FONT_FAMILY_CSS[effFamily];
 
               // outside Edit mode: only show something if this line has a
               // saved override (so edits stay visible while browsing normally)
@@ -894,11 +1034,13 @@ export default function Canvas() {
                 <div
                   key={line.index}
                   onMouseDown={(e) => e.stopPropagation()}
-                  className="absolute"
+                  className="pointer-events-auto absolute"
                   style={{
                     left: `${line.x * 100}%`,
                     top: `${line.yTop * 100}%`,
-                    width: `${Math.max(line.w, 0.02) * 100}%`,
+                    minWidth: `${Math.max(line.w, 0.02) * 100}%`,
+                    width: 'max-content',
+                    maxWidth: `calc(100% - ${line.x * 100}%)`,
                     height: `${line.h * 100}%`,
                   }}
                 >
@@ -906,33 +1048,102 @@ export default function Canvas() {
                     <div className="absolute inset-0 -m-0.5 bg-white" />
                   )}
                   {isEditing ? (
-                    <input
-                      autoFocus
-                      defaultValue={displayText}
-                      style={{ fontSize: `${fontPx}px`, lineHeight: 1 }}
-                      className="absolute inset-0 -m-0.5 w-[calc(100%+4px)] border border-accent bg-white px-0.5 text-black focus:outline-none"
-                      onFocus={(e) => e.target.select()}
-                      onBlur={(e) => {
-                        setLineEdit(doc.id, currentPage, line.index, e.target.value);
-                        setEditingLineIndex(null);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          (e.target as HTMLInputElement).blur();
-                        } else if (e.key === 'Escape') {
+                    <div className="flex items-start gap-1">
+                      <input
+                        autoFocus
+                        defaultValue={displayText}
+                        style={{
+                          fontSize: `${fontPx}px`,
+                          lineHeight: 1,
+                          color: line.color,
+                          fontFamily: fontFamilyCss,
+                          fontWeight: effBold ? 'bold' : 'normal',
+                          fontStyle: effItalic ? 'italic' : 'normal',
+                          textDecoration: effUnderline ? 'underline' : 'none',
+                          width: `${Math.max(
+                            measureTextWidthPx(displayText, fontPx, fontFamilyCss) + 16,
+                            line.w * pageSize.w * zoom
+                          )}px`,
+                        }}
+                        className="border border-accent bg-white px-0.5 focus:outline-none"
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => {
+                          // grow the box live as you type, instead of only
+                          // resizing after the edit is committed
+                          const w = Math.max(
+                            measureTextWidthPx(e.target.value, fontPx, fontFamilyCss) + 16,
+                            line.w * pageSize.w * zoom
+                          );
+                          e.target.style.width = `${w}px`;
+                        }}
+                        onBlur={(e) => {
+                          setLineEdit(doc.id, currentPage, line.index, e.target.value);
                           setEditingLineIndex(null);
-                        }
-                      }}
-                    />
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            (e.target as HTMLInputElement).blur();
+                          } else if (e.key === 'Escape') {
+                            setEditingLineIndex(null);
+                          }
+                        }}
+                      />
+                      <div className="flex gap-0.5 rounded bg-ink-700 p-0.5">
+                        <button
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={() =>
+                            setLineStyleOverride(doc.id, currentPage, line.index, { bold: !effBold })
+                          }
+                          className={`rounded px-1 text-[10px] font-bold ${effBold ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                          title="Bold"
+                        >
+                          B
+                        </button>
+                        <button
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={() =>
+                            setLineStyleOverride(doc.id, currentPage, line.index, { italic: !effItalic })
+                          }
+                          className={`rounded px-1 text-[10px] italic ${effItalic ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                          title="Italic"
+                        >
+                          I
+                        </button>
+                        <button
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onClick={() =>
+                            setLineStyleOverride(doc.id, currentPage, line.index, {
+                              underline: !effUnderline,
+                            })
+                          }
+                          className={`rounded px-1 text-[10px] underline ${effUnderline ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                          title="Underline"
+                        >
+                          U
+                        </button>
+                      </div>
+                    </div>
                   ) : (
                     <div
-                      onClick={() => activeTool === 'edit-text' && setEditingLineIndex(line.index)}
-                      className={`absolute inset-0 flex items-center overflow-hidden whitespace-nowrap px-0.5 text-black ${
+                      onClick={() => {
+                        if (activeTool !== 'edit-text') return;
+                        setEditingLineIndex(line.index);
+                        setActiveEditLine({ docId: doc.id, page: currentPage, lineIndex: line.index });
+                      }}
+                      className={`absolute inset-0 flex items-center whitespace-nowrap px-0.5 ${
                         activeTool === 'edit-text'
                           ? 'cursor-text hover:outline hover:outline-1 hover:outline-dashed hover:outline-accent'
                           : ''
                       }`}
-                      style={{ fontSize: `${fontPx}px`, lineHeight: 1 }}
+                      style={{
+                        fontSize: `${fontPx}px`,
+                        lineHeight: 1,
+                        color: line.color,
+                        fontFamily: fontFamilyCss,
+                        fontWeight: effBold ? 'bold' : 'normal',
+                        fontStyle: effItalic ? 'italic' : 'normal',
+                        textDecoration: effUnderline ? 'underline' : 'none',
+                      }}
                     >
                       {hasOverride ? displayText : activeTool === 'edit-text' ? '\u00A0' : ''}
                     </div>

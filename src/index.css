@@ -21,6 +21,21 @@
   src: url('/fonts/Oswald.ttf') format('truetype');
   font-display: swap;
 }
+@font-face {
+  font-family: 'PDFSuite Poppins';
+  src: url('/fonts/Poppins-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Montserrat';
+  src: url('/fonts/Montserrat-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Roboto';
+  src: url('/fonts/Roboto-Regular.ttf') format('truetype');
+  font-display: swap;
+}
 
 /* Theme tokens. Colors are stored as "R G B" triplets (not hex) so Tailwind's
    opacity-modifier classes (e.g. bg-accent/20) work via rgb(var(--x) / alpha).

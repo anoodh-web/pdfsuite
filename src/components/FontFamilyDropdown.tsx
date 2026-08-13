@@ -7,6 +7,9 @@ const FAMILIES: { value: TextFontFamily; label: string; css: string; group: stri
   { value: 'Display', label: 'Playfair Display', css: '"PDFSuite Display", Georgia, serif', group: 'New' },
   { value: 'Handwriting', label: 'Gochi Hand', css: '"PDFSuite Handwriting", cursive', group: 'New' },
   { value: 'Condensed', label: 'Oswald Condensed', css: '"PDFSuite Condensed", "Arial Narrow", sans-serif', group: 'New' },
+  { value: 'Poppins', label: 'Poppins', css: '"PDFSuite Poppins", Arial, sans-serif', group: 'New' },
+  { value: 'Montserrat', label: 'Montserrat', css: '"PDFSuite Montserrat", Arial, sans-serif', group: 'New' },
+  { value: 'Roboto', label: 'Roboto', css: '"PDFSuite Roboto", Arial, sans-serif', group: 'New' },
 ];
 
 export const FONT_FAMILY_CSS: Record<TextFontFamily, string> = Object.fromEntries(

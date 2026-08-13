@@ -48,6 +48,9 @@ import {
   GitCompare,
   PlayCircle,
   ArrowRight,
+  Bold,
+  Italic,
+  Underline,
   FolderOpen,
   Printer,
   Mail,
@@ -168,6 +171,20 @@ export default function Ribbon() {
     setTextFontSize,
     textFontFamily,
     setTextFontFamily,
+    textBold,
+    setTextBold,
+    textItalic,
+    setTextItalic,
+    textUnderline,
+    setTextUnderline,
+    activeTextBox,
+    pageLines,
+    lineStyleOverrides,
+    setLineStyleOverride,
+    activeEditLine,
+    setTextBoxFontFamily,
+    setTextBoxFontSize,
+    toggleTextBoxStyle,
     findTextInDocument,
     pendingCrop,
     setPendingCrop,
@@ -278,6 +295,38 @@ export default function Ribbon() {
       urls.forEach((u) => URL.revokeObjectURL(u));
     };
   }, [stagedImageFiles]);
+
+  // When a text box is currently open for editing, the Format controls
+  // below act on it directly (and reflect its real current values)
+  // instead of only setting the default for the next new box — this is
+  // the fix for "changing the font/bold/italic does nothing," which
+  // previously had no way to reach whichever box was actually open.
+  const activeBoxAnnotation =
+    activeTextBox &&
+    (annotations[activeTextBox.docId]?.[activeTextBox.page] ?? []).find(
+      (a): a is Extract<typeof a, { type: 'text' }> => a.id === activeTextBox.id && a.type === 'text'
+    );
+
+  // Same idea, for the Edit tool: when a line of existing PDF text is
+  // open for editing, Format controls act on it directly too — using its
+  // effective style (a manual override if one exists, otherwise whatever
+  // was actually detected in the original PDF), the same resolution
+  // export baking uses, so what you see here matches what gets saved.
+  const activeLine =
+    activeEditLine &&
+    (pageLines[activeEditLine.docId]?.[activeEditLine.page] ?? [])[activeEditLine.lineIndex];
+  const activeLineOverride =
+    activeEditLine &&
+    lineStyleOverrides[activeEditLine.docId]?.[activeEditLine.page]?.[activeEditLine.lineIndex];
+  const activeLineStyle = activeLine
+    ? {
+        fontFamily: activeLineOverride?.fontFamily ?? activeLine.fontFamily,
+        fontSize: activeLineOverride?.fontSize ?? Math.round(activeLine.fontSizePt),
+        bold: activeLineOverride?.bold ?? activeLine.bold,
+        italic: activeLineOverride?.italic ?? activeLine.italic,
+        underline: activeLineOverride?.underline ?? false,
+      }
+    : null;
 
   const handleFind = async () => {
     if (!doc || !findQuery.trim()) return;
@@ -395,9 +444,9 @@ export default function Ribbon() {
       <div className="flex h-14 items-center justify-between bg-accent px-4">
         <div className="flex items-center gap-2.5">
           <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-white/95 p-1 shadow-sm">
-            <img src="/logo-64.png" alt="PDF Suite" className="h-8 w-8" />
+            <img src="/logo-64.png" alt="PDF Suite Pro" className="h-8 w-8" />
           </div>
-          <span className="text-xl font-bold text-white">PDF Suite</span>
+          <span className="text-xl font-bold text-white">PDF Suite Pro</span>
           {doc && <span className="ml-1 text-xs text-white/70">— {doc.name}</span>}
         </div>
         <div className="flex items-center gap-3">
@@ -587,8 +636,98 @@ export default function Ribbon() {
             <RibbonGroup title="Format">
               <ColorPicker value={annotationColor} onChange={setAnnotationColor} label="Annotation color" />
               <RibbonButton icon={PaintBucket} label="Fill" active={activeTool === 'fill'} onClick={() => setActiveTool('fill')} />
-              <FontFamilyDropdown value={textFontFamily} onChange={setTextFontFamily} />
-              <FontSizeDropdown value={textFontSize} onChange={setTextFontSize} />
+              <FontFamilyDropdown
+                value={
+                  activeLineStyle
+                    ? activeLineStyle.fontFamily
+                    : activeBoxAnnotation
+                    ? activeBoxAnnotation.fontFamily ?? 'Helvetica'
+                    : textFontFamily
+                }
+                onChange={(family) => {
+                  setTextFontFamily(family);
+                  if (activeEditLine) {
+                    setLineStyleOverride(activeEditLine.docId, activeEditLine.page, activeEditLine.lineIndex, {
+                      fontFamily: family,
+                    });
+                  } else if (activeTextBox) {
+                    setTextBoxFontFamily(activeTextBox.docId, activeTextBox.page, activeTextBox.id, family);
+                  }
+                }}
+              />
+              <FontSizeDropdown
+                value={
+                  activeLineStyle
+                    ? activeLineStyle.fontSize
+                    : activeBoxAnnotation
+                    ? activeBoxAnnotation.fontSize
+                    : textFontSize
+                }
+                onChange={(size) => {
+                  setTextFontSize(size);
+                  if (activeEditLine) {
+                    setLineStyleOverride(activeEditLine.docId, activeEditLine.page, activeEditLine.lineIndex, {
+                      fontSize: size,
+                    });
+                  } else if (activeTextBox) {
+                    setTextBoxFontSize(activeTextBox.docId, activeTextBox.page, activeTextBox.id, size);
+                  }
+                }}
+              />
+              <RibbonButton
+                icon={Bold}
+                label="Bold"
+                active={activeLineStyle ? activeLineStyle.bold : activeBoxAnnotation ? !!activeBoxAnnotation.bold : textBold}
+                onClick={() => {
+                  if (activeEditLine && activeLineStyle) {
+                    setLineStyleOverride(activeEditLine.docId, activeEditLine.page, activeEditLine.lineIndex, {
+                      bold: !activeLineStyle.bold,
+                    });
+                  } else if (activeTextBox) {
+                    toggleTextBoxStyle(activeTextBox.docId, activeTextBox.page, activeTextBox.id, 'bold');
+                  } else {
+                    setTextBold(!textBold);
+                  }
+                }}
+              />
+              <RibbonButton
+                icon={Italic}
+                label="Italic"
+                active={activeLineStyle ? activeLineStyle.italic : activeBoxAnnotation ? !!activeBoxAnnotation.italic : textItalic}
+                onClick={() => {
+                  if (activeEditLine && activeLineStyle) {
+                    setLineStyleOverride(activeEditLine.docId, activeEditLine.page, activeEditLine.lineIndex, {
+                      italic: !activeLineStyle.italic,
+                    });
+                  } else if (activeTextBox) {
+                    toggleTextBoxStyle(activeTextBox.docId, activeTextBox.page, activeTextBox.id, 'italic');
+                  } else {
+                    setTextItalic(!textItalic);
+                  }
+                }}
+              />
+              <RibbonButton
+                icon={Underline}
+                label="Underline"
+                active={
+                  activeLineStyle
+                    ? activeLineStyle.underline
+                    : activeBoxAnnotation
+                    ? !!activeBoxAnnotation.underline
+                    : textUnderline
+                }
+                onClick={() => {
+                  if (activeEditLine && activeLineStyle) {
+                    setLineStyleOverride(activeEditLine.docId, activeEditLine.page, activeEditLine.lineIndex, {
+                      underline: !activeLineStyle.underline,
+                    });
+                  } else if (activeTextBox) {
+                    toggleTextBoxStyle(activeTextBox.docId, activeTextBox.page, activeTextBox.id, 'underline');
+                  } else {
+                    setTextUnderline(!textUnderline);
+                  }
+                }}
+              />
             </RibbonGroup>
             <RibbonGroup title="Find">
               <div className="flex items-center gap-1">

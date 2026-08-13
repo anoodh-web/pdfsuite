@@ -1,41 +1,50 @@
-# PDF Suite (v1.2.11)
+# PDF Suite Pro (v1.2.11)
 
-## This round
+## This round: full Edit-tool typography parity
 
-### 1. Fixed — real file preview before conversion
-Previously, staging a Word file or image(s) for conversion only showed
-the filename as plain text \u2014 no actual visual. Now:
-- **Images**: real thumbnails of the selected file(s), generated
-  directly from the files you picked (up to 3 shown, "+N" for more)
-- **Word files**: a document-style card with the filename and file size
+### 1. Bold weight preservation — the actual fix
+Real, verified detection: pdf.js exposes each font's genuine base name
+via `page.commonObjs` (e.g. "Helvetica-Bold"), confirmed against a real
+generated test PDF before relying on it. Editing existing bold text now
+correctly recognizes it was bold and keeps it that way, instead of
+silently dropping to regular weight. Italic detection added the same
+way, for the same reason.
 
-Both appear directly next to the Choose buttons, before you click
-Convert \u2014 so you can confirm you picked the right file(s) first.
+### 2. Full formatting parity between Type Text and Edit
+Font Family, Font Size, Bold, Italic, and Underline now all work
+identically whether you're in a new Type Text box or editing existing
+PDF text with the Edit tool:
 
-### 2. Sign-in prompt on launch
-A welcome modal now appears automatically the first time you open PDF
-Suite (browser or desktop) if you haven't signed in yet \u2014 just Name and
-Email, matching the existing sign-in system already used elsewhere in
-the app (Section 2.3 of the user manual). Skippable, and honest about
-what it actually does: this personalizes the app locally (auto-fills
-your name as signer/author), it isn't a secured account system.
-"Skip for now" only dismisses it for that session \u2014 a genuinely fresh
-launch with no saved profile will show it again, matching "trigger on
-launch" rather than a one-time nag you could accidentally dismiss
-forever.
+- Each line you edit now has its own small B/I/U toggle buttons, right
+  next to it, same as text boxes already had
+- The ribbon's Format controls (Font Family/Size/Bold/Italic/Underline)
+  now reach whichever *line* you have open for editing too, not just
+  text boxes \u2014 same fix pattern as two rounds ago, extended to cover
+  this second, separate editing surface
+- Changes actually save: a genuine override system now sits on top of
+  the detected original style, and export baking was rewritten to
+  resolve and apply it \u2014 including for lines where you only changed
+  formatting without touching the text itself, which the previous code
+  silently ignored entirely
 
-### 3. Version bumped to 1.2.11
-Updated consistently everywhere the version appears: `package.json`,
-the Tauri desktop config (`tauri.conf.json`, `Cargo.toml` \u2014 so a new
-desktop build picks it up too), and the File \u2192 About screen.
+### Real bug caught and fixed during this work, not after
+While restructuring the export-baking loop, a leftover extra closing
+brace broke the whole build. Rather than guessing at a fix, I wrote a
+short script to count brace depth line-by-line through the function and
+pinpoint exactly where the structure diverged from what it should be,
+confirmed the diagnosis, fixed it, and rebuilt clean before packaging
+this.
 
-## Everything else (recap)
-Explicit Convert-button workflow with directional arrows, toast
-notifications, real Word/Image \u2192 PDF file saving, 5 conversion/
-organization tools, burgundy rebrand, expanded font library, ribbon
-reorganization, scrolling fixes, PDF compression, viewer, annotations,
-OCR, security, signatures, batch processing, forms, light/dark theme,
-Tauri 2 desktop packaging.
+## Recap of what's already fixed in earlier checkpoints (included here)
+Select tool now enables real native text selection over the PDF's
+actual content (not just our own annotations), erase/redaction border
+(real pixel-rounding fix), text-edit clipping, sticky notes draggable,
+form fields deletable, Font Family/Bold/Italic/Underline live on the
+active text box.
+
+## Still open
+Expanding the font library further, and signature fonts in the Type
+Signature modal.
 
 ## Run it
 
