@@ -15,6 +15,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { useDocumentStore, type OpenDocument } from '../store/useDocumentStore';
+import UpdateChecker from './UpdateChecker';
 
 type Section = 'info' | 'new' | 'open' | 'save' | 'print' | 'share' | 'about';
 
@@ -284,11 +285,12 @@ export default function BackstageView({
               <img src="/logo-256.png" alt="PDF Suite Pro" className="h-20 w-20 shrink-0" />
               <div>
                 <div className="text-xl font-bold text-accent">PDF Suite Pro</div>
-                <div className="mb-3 text-xs text-muted">Version 1.2.11</div>
-                <div className="space-y-1 text-sm text-paper/80">
+                <div className="mb-3 text-xs text-muted">Version 2.0.8</div>
+                <div className="mb-4 space-y-1 text-sm text-paper/80">
                   <div>Developed &amp; Engineered by AD Labs</div>
                   <div>Lead Developer: Anoodh</div>
                 </div>
+                <UpdateChecker />
               </div>
             </div>
           </div>

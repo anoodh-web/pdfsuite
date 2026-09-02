@@ -7,6 +7,8 @@ import {
   FileSignature,
   FilePlus2,
   Layers,
+  Scissors,
+  FileStack,
   FileText,
   Send,
   Share2,
@@ -61,6 +63,9 @@ import DigitalSignatureModal from './DigitalSignatureModal';
 import BatchProcessor from './BatchProcessor';
 import OrganizePagesModal from './OrganizePagesModal';
 import ComparePdfModal from './ComparePdfModal';
+import SplitPdfModal from './SplitPdfModal';
+import MergePdfModal from './MergePdfModal';
+import ImageReorderModal from './ImageReorderModal';
 import PropertiesModal from './PropertiesModal';
 import SaveAsModal from './SaveAsModal';
 import ColorPicker from './ColorPicker';
@@ -143,6 +148,7 @@ export default function Ribbon() {
     exportToPng,
     compressDocument,
     showToast,
+    saveAsToLocation,
     formFields,
     lineEdits,
     flattenForm,
@@ -214,6 +220,9 @@ export default function Ribbon() {
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [showOrganizeModal, setShowOrganizeModal] = useState(false);
   const [showCompareModal, setShowCompareModal] = useState(false);
+  const [showSplitModal, setShowSplitModal] = useState(false);
+  const [showMergeModal, setShowMergeModal] = useState(false);
+  const [showReorderModal, setShowReorderModal] = useState(false);
   const [showPropertiesModal, setShowPropertiesModal] = useState(false);
   const [showSaveAsModal, setShowSaveAsModal] = useState(false);
   const [showBackstage, setShowBackstage] = useState(false);
@@ -582,6 +591,8 @@ export default function Ribbon() {
             </RibbonGroup>
             <RibbonGroup title="Assemble">
               <RibbonButton icon={FileOutput} label="Extract Page" large disabled={!doc} onClick={() => doc && extractPages(doc.id, [currentPage])} />
+              <RibbonButton icon={Scissors} label="Split" large disabled={!doc} onClick={() => setShowSplitModal(true)} />
+              <RibbonButton icon={FileStack} label="Merge PDFs" large onClick={() => setShowMergeModal(true)} />
               <RibbonButton icon={Layers} label="Combine Open Files" large disabled={documents.length < 2} onClick={mergeAllOpenDocuments} />
             </RibbonGroup>
             <RibbonGroup title="Stamp">
@@ -867,12 +878,16 @@ export default function Ribbon() {
                     ) : (
                       <div className="flex items-center gap-1">
                         {imagePreviewUrls.slice(0, 3).map((url, i) => (
-                          <img
-                            key={url}
-                            src={url}
-                            alt={stagedImageFiles[i]?.name ?? 'preview'}
-                            className="h-9 w-9 rounded border border-ink-500 object-cover"
-                          />
+                          <div key={url} className="relative">
+                            <img
+                              src={url}
+                              alt={stagedImageFiles[i]?.name ?? 'preview'}
+                              className="h-9 w-9 rounded border border-ink-500 object-cover"
+                            />
+                            <div className="absolute -left-1 -top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-[8px] font-bold text-white">
+                              {i + 1}
+                            </div>
+                          </div>
                         ))}
                         {stagedImageFiles.length > 3 && (
                           <div className="flex h-9 w-9 items-center justify-center rounded border border-ink-500 bg-ink-700 text-[10px] text-muted">
@@ -882,6 +897,14 @@ export default function Ribbon() {
                         <span className="ml-1 text-[10px] text-muted">
                           {stagedImageFiles.length} image{stagedImageFiles.length > 1 ? 's' : ''}
                         </span>
+                        {stagedImageFiles.length > 1 && (
+                          <button
+                            onClick={() => setShowReorderModal(true)}
+                            className="ml-1 rounded border border-accent/50 px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent-soft"
+                          >
+                            Reorder
+                          </button>
+                        )}
                       </div>
                     )}
                     <XIcon
@@ -1118,6 +1141,23 @@ export default function Ribbon() {
         <ComparePdfModal docA={doc} onClose={() => setShowCompareModal(false)} />
       )}
 
+      {showSplitModal && doc && (
+        <SplitPdfModal docId={doc.id} pageCount={doc.pageCount} onClose={() => setShowSplitModal(false)} />
+      )}
+
+      {showMergeModal && <MergePdfModal onClose={() => setShowMergeModal(false)} />}
+
+      {showReorderModal && stagedImageFiles.length > 1 && (
+        <ImageReorderModal
+          files={stagedImageFiles}
+          onConfirm={(reordered) => {
+            setStagedImageFiles(reordered);
+            setShowReorderModal(false);
+          }}
+          onClose={() => setShowReorderModal(false)}
+        />
+      )}
+
       {showPropertiesModal && doc && (
         <PropertiesModal docId={doc.id} onClose={() => setShowPropertiesModal(false)} />
       )}
@@ -1146,7 +1186,18 @@ export default function Ribbon() {
           onSave={() => doc && exportDocument(doc.id)}
           onSaveAs={() => {
             setShowBackstage(false);
-            setShowSaveAsModal(true);
+            if (!doc) return;
+            saveAsToLocation(doc.id).then((result) => {
+              if (result === 'unsupported') {
+                // this browser doesn't support the real folder picker —
+                // fall back to the existing filename-only flow, which
+                // still saves to the browser's normal Downloads location
+                setShowSaveAsModal(true);
+              } else if (result === 'saved') {
+                showToast('The file has been successfully saved to the chosen location.');
+              }
+              // 'cancelled' — user closed the dialog, do nothing further
+            });
           }}
           onPrint={handlePrint}
           onProperties={() => {

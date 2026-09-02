@@ -1,50 +1,55 @@
-# PDF Suite Pro (v1.2.11)
+# PDF Suite Pro (v2.0.7)
 
-## This round: full Edit-tool typography parity
+## This round: PDF Merge tool (the last of the 4 requested items)
 
-### 1. Bold weight preservation — the actual fix
-Real, verified detection: pdf.js exposes each font's genuine base name
-via `page.commonObjs` (e.g. "Helvetica-Bold"), confirmed against a real
-generated test PDF before relying on it. Editing existing bold text now
-correctly recognizes it was bold and keeps it that way, instead of
-silently dropping to regular weight. Italic detection added the same
-way, for the same reason.
+Page Layout tab \u2192 Merge PDFs. A genuinely self-contained tool, distinct
+from the existing "Combine Open Files":
 
-### 2. Full formatting parity between Type Text and Edit
-Font Family, Font Size, Bold, Italic, and Underline now all work
-identically whether you're in a new Type Text box or editing existing
-PDF text with the Edit tool:
+- **Combine Open Files** (already existed) \u2014 merges whatever documents
+  you already have open as tabs
+- **Merge PDFs** (new) \u2014 pick files directly from a file picker, no
+  need to open each one as a tab first, then drag them into the exact
+  order you want before merging
 
-- Each line you edit now has its own small B/I/U toggle buttons, right
-  next to it, same as text boxes already had
-- The ribbon's Format controls (Font Family/Size/Bold/Italic/Underline)
-  now reach whichever *line* you have open for editing too, not just
-  text boxes \u2014 same fix pattern as two rounds ago, extended to cover
-  this second, separate editing surface
-- Changes actually save: a genuine override system now sits on top of
-  the detected original style, and export baking was rewritten to
-  resolve and apply it \u2014 including for lines where you only changed
-  formatting without touching the text itself, which the previous code
-  silently ignored entirely
+## What it does
+1. Click "Add PDF Files" \u2014 pick 2 or more, repeat to add more from
+   different folders if needed
+2. Drag to reorder \u2014 numbered positions show exactly what order pages
+   will end up in
+3. Remove any file with the X before merging, if you picked the wrong one
+4. Merge \u2014 opens the combined result in the app and saves it as
+   "Merged.pdf"
 
-### Real bug caught and fixed during this work, not after
-While restructuring the export-baking loop, a leftover extra closing
-brace broke the whole build. Rather than guessing at a fix, I wrote a
-short script to count brace depth line-by-line through the function and
-pinpoint exactly where the structure diverged from what it should be,
-confirmed the diagnosis, fixed it, and rebuilt clean before packaging
-this.
+## Verified before shipping, not just assumed correct
+Built 3 distinct test PDFs (different page counts) and merged them in a
+deliberately non-alphabetical order (C, then A, then B) \u2014 confirmed the
+output has exactly the right total page count, and separately extracted
+the text from every page in the result to confirm the actual page
+*order* matches exactly what was requested, not upload order or
+alphabetical order.
 
-## Recap of what's already fixed in earlier checkpoints (included here)
-Select tool now enables real native text selection over the PDF's
-actual content (not just our own annotations), erase/redaction border
-(real pixel-rounding fix), text-edit clipping, sticky notes draggable,
-form fields deletable, Font Family/Bold/Italic/Underline live on the
-active text box.
+Also tested the error-handling path specifically: mixed one genuinely
+corrupt file in with a valid one, confirmed the valid file's pages still
+merge in successfully and the corrupt one is cleanly skipped and
+reported \u2014 rather than either silently dropping it with no explanation,
+or failing the entire merge over one bad file.
 
-## Still open
-Expanding the font library further, and signature fonts in the Type
-Signature modal.
+One more thing carried over deliberately: each file is loaded the same
+careful way the false-"Password Protected"-prompt fix taught this app to
+open files \u2014 trying an empty password automatically first \u2014 so an
+invoice-style PDF with only owner/permissions restrictions merges in
+correctly too, not just files with no security settings at all.
+
+## Recap of everything from this round (all 4 items now complete)
+"Save As" now genuinely preserves all your changes (was silently
+skipping annotation baking before). JPG-to-PDF conversion has a real
+drag-to-reorder step. Save As can prompt for a real destination folder
+in Chrome/Edge and the desktop app. Merge PDFs is new.
+
+## What to test
+Page Layout \u2192 Merge PDFs \u2192 pick 3 files from different sources \u2192 drag
+them into a specific order \u2192 Merge \u2192 confirm the resulting page order
+in the app matches what you set, not upload order.
 
 ## Run it
 

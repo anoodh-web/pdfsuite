@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { FilePlus2, FileWarning, X } from 'lucide-react';
 import { TextLayer } from 'pdfjs-dist';
-import { useDocumentStore, type Annotation } from '../store/useDocumentStore';
+import {
+  useDocumentStore,
+  LINE_BASELINE_RATIO,
+  sampleBoxBackgroundColor,
+  type Annotation,
+  type CachedLine,
+} from '../store/useDocumentStore';
 import SignaturePad from './SignaturePad';
 import { FONT_FAMILY_CSS } from './FontFamilyDropdown';
 
@@ -123,6 +129,31 @@ export default function Canvas() {
       cancelled = true;
     };
   }, [doc, currentPage, zoom]);
+
+  // Cache of sampled real background colors, keyed by line index — cleared
+  // whenever the page or zoom changes (a fresh canvas render invalidates
+  // any previous samples). Sampling is cheap (six 1x1-pixel reads) but
+  // there's no reason to redo it on every keystroke elsewhere on the page.
+  const bgSampleCache = useRef<Map<number, string>>(new Map());
+  useEffect(() => {
+    bgSampleCache.current = new Map();
+  }, [doc?.id, currentPage, pageSize.w, pageSize.h]);
+
+  const getSampledBackground = (line: CachedLine): string => {
+    const cached = bgSampleCache.current.get(line.index);
+    if (cached) return cached;
+    const ctx = canvasRef.current?.getContext('2d');
+    if (!ctx) return '#FFFFFF';
+    const color = sampleBoxBackgroundColor(
+      ctx,
+      line.x * pageSize.w,
+      line.yTop * pageSize.h,
+      Math.max(line.w * pageSize.w, 4),
+      line.h * pageSize.h
+    );
+    bgSampleCache.current.set(line.index, color);
+    return color;
+  };
 
   // Global keyboard shortcuts: Ctrl/Cmd+Z undo, Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z
   // redo, Delete/Backspace removes the selected annotation, Up/Down arrows
@@ -428,6 +459,13 @@ export default function Canvas() {
             h,
             applied: false,
           });
+          if (activeTool === 'erase') {
+            // Erase Area is meant to feel instant — no separate Apply
+            // step, unlike Mark Redaction (Protect tab), which stays a
+            // deliberate mark-then-review-then-commit workflow since
+            // that's typically used more carefully/for compliance.
+            applyRedactions(doc.id);
+          }
         } else {
           addAnnotation(doc.id, {
             id: uid(),
@@ -685,10 +723,10 @@ export default function Canvas() {
             )}
 
             {/* Unapplied erase marks stay visible with a dashed border so a
-                pure-white mark doesn't just disappear into the white page —
-                but a border alone can look like a permanent flaw rather
-                than a provisional state. This label makes the "not done
-                yet, click Apply" meaning explicit rather than implied. */}
+                pure-white mark doesn't just disappear into the white page.
+                Erase Area now auto-applies immediately, so this only
+                shows for the brief moment while that's actually running —
+                still worth a clear label rather than an unexplained flash. */}
             {pageAnnotations
               .filter(
                 (a): a is Extract<Annotation, { type: 'redact' }> =>
@@ -704,7 +742,7 @@ export default function Canvas() {
                     transform: 'translateY(-100%)',
                   }}
                 >
-                  Pending — click Apply on the Edit tab
+                  Erasing…
                 </div>
               ))}
             {pageAnnotations
@@ -1008,10 +1046,27 @@ export default function Canvas() {
 
             {(pageLines[doc.id]?.[currentPage] ?? []).map((line) => {
               const textOverride = lineEdits[doc.id]?.[currentPage]?.[line.index];
-              const hasOverride = textOverride !== undefined && textOverride !== line.text;
+              const hasTextOverride = textOverride !== undefined && textOverride !== line.text;
               const isEditing = editingLineIndex === line.index;
               const displayText = textOverride ?? line.text;
               const styleOverride = lineStyleOverrides[doc.id]?.[currentPage]?.[line.index];
+              const hasStyleOverride =
+                !!styleOverride &&
+                (styleOverride.fontFamily !== undefined ||
+                  styleOverride.fontSize !== undefined ||
+                  styleOverride.bold !== undefined ||
+                  styleOverride.italic !== undefined ||
+                  !!styleOverride.underline);
+              // A line needs to keep rendering its live overlay if
+              // *either* its text or its formatting has been changed —
+              // this was the actual bug behind "formatting doesn't show
+              // until Apply": a pure style change (bold toggled, no text
+              // edited) was only ever checked against the text override,
+              // so the overlay disappeared the instant you weren't
+              // actively editing that exact line, and Apply — which
+              // bakes the change permanently into the page pixels — was
+              // the only thing that made it visible again.
+              const hasOverride = hasTextOverride || hasStyleOverride;
               // effective style = whatever's been manually overridden,
               // falling back to what was actually detected in the
               // original PDF — this is what makes bold/italic/family
@@ -1045,7 +1100,10 @@ export default function Canvas() {
                   }}
                 >
                   {hasOverride && !isEditing && (
-                    <div className="absolute inset-0 -m-0.5 bg-white" />
+                    <div
+                      className="absolute -inset-0.5"
+                      style={{ backgroundColor: getSampledBackground(line) }}
+                    />
                   )}
                   {isEditing ? (
                     <div className="flex items-start gap-1">
@@ -1060,12 +1118,24 @@ export default function Canvas() {
                           fontWeight: effBold ? 'bold' : 'normal',
                           fontStyle: effItalic ? 'italic' : 'normal',
                           textDecoration: effUnderline ? 'underline' : 'none',
+                          // Same sampled real background used for the
+                          // committed display state, not hardcoded white —
+                          // otherwise editing text on a colored banner
+                          // showed a jarring white box the entire time you
+                          // were actively typing, which was especially bad
+                          // when the original text itself was white (a
+                          // common banner-title color): white text on a
+                          // white input was effectively invisible while
+                          // editing. The accent-colored border below still
+                          // clearly marks this as the active edit box
+                          // regardless of what the fill color is.
+                          backgroundColor: getSampledBackground(line),
                           width: `${Math.max(
                             measureTextWidthPx(displayText, fontPx, fontFamilyCss) + 16,
                             line.w * pageSize.w * zoom
                           )}px`,
                         }}
-                        className="border border-accent bg-white px-0.5 focus:outline-none"
+                        className="border border-accent px-0.5 focus:outline-none"
                         onFocus={(e) => e.target.select()}
                         onChange={(e) => {
                           // grow the box live as you type, instead of only
@@ -1130,7 +1200,7 @@ export default function Canvas() {
                         setEditingLineIndex(line.index);
                         setActiveEditLine({ docId: doc.id, page: currentPage, lineIndex: line.index });
                       }}
-                      className={`absolute inset-0 flex items-center whitespace-nowrap px-0.5 ${
+                      className={`absolute inset-0 flex items-end whitespace-nowrap px-0.5 ${
                         activeTool === 'edit-text'
                           ? 'cursor-text hover:outline hover:outline-1 hover:outline-dashed hover:outline-accent'
                           : ''
@@ -1138,6 +1208,18 @@ export default function Canvas() {
                       style={{
                         fontSize: `${fontPx}px`,
                         lineHeight: 1,
+                        // Bottom-aligned to approximate where the real text
+                        // baseline sits within the box (~81% down, near the
+                        // bottom, not centered) — matching the same ratio
+                        // export baking uses to place text, rather than the
+                        // previous flex-centering, which put the baseline at
+                        // 50% of the box height: a ~31-percentage-point gap
+                        // between what was shown live and what actually got
+                        // saved. This won't be pixel-perfect in every case —
+                        // CSS and canvas text rendering use slightly
+                        // different font-metric assumptions — but it closes
+                        // the vast majority of that gap.
+                        paddingBottom: `${Math.max(0, (1 - LINE_BASELINE_RATIO) * line.h * pageSize.h * zoom - fontPx * 0.08)}px`,
                         color: line.color,
                         fontFamily: fontFamilyCss,
                         fontWeight: effBold ? 'bold' : 'normal',

@@ -69,7 +69,9 @@ export type TextFontFamily =
   | 'Condensed'
   | 'Poppins'
   | 'Montserrat'
-  | 'Roboto';
+  | 'Roboto'
+  | 'OpenSans'
+  | 'Merriweather';
 
 export interface TextBoxAnnotation extends BaseAnnotation {
   type: 'text';
@@ -262,6 +264,61 @@ export interface CachedLine {
   italic: boolean; // detected original slant
 }
 
+// Shared geometry for detected text lines — used both when computing each
+// line's display box (loadPageLines) and when baking edited text back into
+// the page (applyRedactions), so the two are provably consistent rather
+// than relying on two independently-guessed numbers landing close enough.
+// LINE_HEIGHT_MULT is the box height as a multiple of font size; ASCENT_MULT
+// is how far the baseline sits below the top of that box. Their ratio is
+// where the baseline falls within the box (~0.808, i.e. near the bottom,
+// as real text baselines are — not centered).
+const LINE_HEIGHT_MULT = 1.3;
+const ASCENT_MULT = 1.05;
+export const LINE_BASELINE_RATIO = ASCENT_MULT / LINE_HEIGHT_MULT;
+
+// Samples the real rendered color around a text box, avoiding its center
+// (where the glyphs we're trying to hide actually are) so the "cover"
+// drawn behind edited text matches its real surroundings — a colored
+// banner, a shaded table row — instead of always being flat white, which
+// broke visibly outside a plain white page. Used both for the on-screen
+// preview and for what actually gets baked into the saved file, so the
+// two agree with each other, not just each independently guessing white.
+export function sampleBoxBackgroundColor(
+  ctx: CanvasRenderingContext2D,
+  px: number,
+  py: number,
+  pw: number,
+  ph: number
+): string {
+  const points: [number, number][] = [
+    [px + 1, py + 1],
+    [px + pw - 1, py + 1],
+    [px + 1, py + ph - 1],
+    [px + pw - 1, py + ph - 1],
+    [px + pw / 2, py + 1],
+    [px + pw / 2, py + ph - 1],
+  ];
+  const counts = new Map<string, number>();
+  for (const [x, y] of points) {
+    try {
+      const data = ctx.getImageData(Math.max(0, Math.round(x)), Math.max(0, Math.round(y)), 1, 1).data;
+      const hex = `#${[data[0], data[1], data[2]].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+      counts.set(hex, (counts.get(hex) ?? 0) + 1);
+    } catch {
+      // out-of-bounds or tainted canvas — skip this sample point
+    }
+  }
+  let best = '#FFFFFF';
+  let bestCount = 0;
+  for (const [color, count] of counts) {
+    if (count > bestCount) {
+      bestCount = count;
+      best = color;
+    }
+  }
+  return best;
+}
+
 function multiplyMatrix(m1: number[], m2: number[]): number[] {
   return [
     m1[0] * m2[0] + m1[2] * m2[1],
@@ -383,20 +440,77 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
   const drawableItems = items.filter((it) => it.str !== '');
   drawableItems.forEach((it, i) => itemColor.set(it, colorSamples[i] ?? '#000000'));
 
-  // group into lines by baseline proximity
-  const lines: { y: number; parts: Item[] }[] = [];
+  // Group into lines by baseline proximity AND horizontal proximity.
+  //
+  // This is the fix for a real, confirmed bug: grouping by Y-baseline
+  // alone merges content from different table columns whenever they
+  // happen to share a baseline — e.g. a "Traveler: ..." field on the
+  // left and an unrelated "Agency: ..." field on the right of the same
+  // visual row. The two are genuinely separate fields, but shared a
+  // baseline in the PDF, so they were being treated as one continuous
+  // editable line spanning the entire row width. Editing that merged
+  // "line" then collapsed two unrelated fields into a single string,
+  // which is exactly the "selects a whole block" and "text shifts out
+  // of position" behavior reported — the fix isn't really about
+  // selection or repositioning at all, it's that the line was wrong
+  // from the moment it was detected.
+  //
+  // A large horizontal gap at a matching baseline is treated as a
+  // column boundary (a new, separate line) rather than the same line —
+  // ordinary single-line text essentially never has a gap this size,
+  // but two unrelated table columns very commonly do.
+  const lines: { y: number; parts: Item[]; minX: number; maxRight: number }[] = [];
   for (const item of items) {
-    if (!item.str.trim() && item.str !== ' ') continue;
+    // Whitespace-only items are excluded here entirely, not just the
+    // empty-string EOL markers. pdf.js synthesizes a "space" item to
+    // fill any gap between disjoint text-showing operations, and gives
+    // it a width equal to the *entire* visual gap — verified directly:
+    // a real 236pt gap between two unrelated table-column fields showed
+    // up as a single space item with a 236pt-wide box. Letting that
+    // synthetic item extend a line's boundary silently absorbed the gap
+    // before the next real word could ever be checked against it, which
+    // defeated the column-boundary detection below entirely. Real word
+    // items alone are enough to detect gaps correctly, and the line-text
+    // reconstruction step further down already synthesizes its own
+    // spacing from real word positions, so nothing is lost by excluding these.
+    if (!item.str.trim()) continue;
     const y = item.transform[5];
-    let line = lines.find((l) => Math.abs(l.y - y) < 2.5);
-    if (!line) {
-      line = { y, parts: [] };
-      lines.push(line);
+    const x = item.transform[4];
+    const size = Math.hypot(item.transform[0], item.transform[1]) || 10;
+    const itemRight = x + item.width;
+    // Same threshold the codebase already uses to decide "this gap looks
+    // like a different field, insert a tab rather than a space" — tested
+    // directly against the real uploaded ticket: a genuine field boundary
+    // (Traveler's value ending, Agency's label starting) measured a
+    // 49pt gap at 10pt font, a 4.9x ratio. An arbitrary 12x threshold
+    // I'd picked first (calibrated only against my own synthetic test,
+    // not a real document) was too generous and still merged them —
+    // caught by testing against the actual file, not by assuming the
+    // first version was correct.
+    const HUGE_GAP = size * 1.8;
+
+    let bestLine: (typeof lines)[number] | undefined;
+    let bestGap = Infinity;
+    for (const l of lines) {
+      if (Math.abs(l.y - y) >= 2.5) continue;
+      const gap = x > l.maxRight ? x - l.maxRight : l.minX > itemRight ? l.minX - itemRight : 0;
+      if (gap < HUGE_GAP && gap < bestGap) {
+        bestGap = gap;
+        bestLine = l;
+      }
     }
-    line.parts.push(item);
+
+    if (!bestLine) {
+      bestLine = { y, parts: [], minX: x, maxRight: itemRight };
+      lines.push(bestLine);
+    } else {
+      bestLine.minX = Math.min(bestLine.minX, x);
+      bestLine.maxRight = Math.max(bestLine.maxRight, itemRight);
+    }
+    bestLine.parts.push(item);
   }
 
-  lines.sort((a, b) => b.y - a.y); // top to bottom (PDF y grows upward)
+  lines.sort((a, b) => (Math.abs(b.y - a.y) < 2.5 ? a.minX - b.minX : b.y - a.y)); // top to bottom, then left to right within a shared baseline
 
   return lines.map((line) => {
     line.parts.sort((a, b) => a.transform[4] - b.transform[4]);
@@ -613,6 +727,16 @@ const CUSTOM_FONT_FILES: Record<
     bold: '/fonts/Roboto-Bold.ttf',
     italic: '/fonts/Roboto-Italic.ttf',
   },
+  OpenSans: {
+    regular: '/fonts/OpenSans-Regular.ttf',
+    bold: '/fonts/OpenSans-Bold.ttf',
+    italic: '/fonts/OpenSans-Italic.ttf',
+  },
+  Merriweather: {
+    regular: '/fonts/Merriweather-Regular.ttf',
+    bold: '/fonts/Merriweather-Bold.ttf',
+    italic: '/fonts/Merriweather-Italic.ttf',
+  },
 };
 const fontByteCache = new Map<string, ArrayBuffer>();
 async function fetchFontBytes(url: string): Promise<ArrayBuffer> {
@@ -639,6 +763,14 @@ type AnnotationsByDoc = Record<string, Record<number, Annotation[]>>;
 interface HistoryEntry {
   annotations: AnnotationsByDoc;
   lineEdits: Record<string, Record<number, Record<number, string>>>;
+  lineStyleOverrides: Record<string, Record<number, Record<number, Partial<LineStyleOverride>>>>;
+  // Present only for actions that mutate the actual PDF document structure
+  // (rotate, crop, insert/delete page, form field create/delete) — these
+  // bypass the annotation-based history entirely otherwise, since they
+  // change doc.pdfLibDoc directly rather than adding an annotation.
+  // Capturing the whole document's bytes before the mutation is what lets
+  // undo/redo actually restore it, not just the annotation overlay state.
+  pdfSnapshot?: { docId: string; bytes: Uint8Array };
 }
 
 interface DocumentState {
@@ -735,8 +867,17 @@ interface DocumentState {
   insertBlankPage: (docId: string, afterIndex: number) => Promise<void>;
   reorderPage: (docId: string, fromIndex: number, toIndex: number) => Promise<void>;
   extractPages: (docId: string, range: number[]) => Promise<void>;
+  splitDocument: (
+    docId: string,
+    mode: 'every-page' | 'every-n' | 'ranges',
+    options: { n?: number; ranges?: string }
+  ) => Promise<{ ok: true; fileCount: number } | { ok: false; error: string }>;
   mergeAllOpenDocuments: () => Promise<void>;
+  mergeSelectedFiles: (
+    files: File[]
+  ) => Promise<{ ok: true; skipped: string[] } | { ok: false; error: string }>;
   exportDocument: (docId: string) => Promise<void>;
+  buildExportBytes: (docId: string) => Promise<Uint8Array | null>;
 
   // annotations
   addAnnotation: (docId: string, annotation: Annotation) => void;
@@ -754,8 +895,9 @@ interface DocumentState {
     h: number
   ) => void;
   deleteAnnotation: (docId: string, page: number, id: string) => void;
-  undo: () => void;
-  redo: () => void;
+  pushStructuralHistory: (docId: string) => Promise<void>;
+  undo: () => Promise<void>;
+  redo: () => Promise<void>;
   exportToWord: (docId: string) => Promise<void>;
   exportToPng: (docId: string) => Promise<void>;
   addImageAnnotation: (docId: string, file: File) => Promise<void>;
@@ -814,6 +956,7 @@ interface DocumentState {
   // File tab
   createBlankDocument: () => Promise<void>;
   saveAsWithName: (docId: string, newName: string) => Promise<void>;
+  saveAsToLocation: (docId: string) => Promise<'saved' | 'unsupported' | 'cancelled'>;
   getDocumentMetadata: (docId: string) => {
     title: string;
     author: string;
@@ -910,11 +1053,29 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       pdfLibDoc = await PDFDocument.load(buf, { ignoreEncryption: false });
     } catch (e) {
       if (e instanceof EncryptedPDFError) {
-        // pause here — ask the user for the password before opening anything
-        set({ pendingEncryptedFile: { name: file.name, bytes: buf }, passwordError: null });
-        return;
+        // Many real-world PDFs (this exact pattern was confirmed against
+        // an actual invoice generated by a business PDF tool before
+        // shipping this fix) are encrypted with an owner/permissions
+        // password but *no* open password at all — the empty string is
+        // a fully valid password for them. Adobe and Nitro open these
+        // silently, with no prompt, since opening never actually needed
+        // a password; only some editing permissions are restricted. The
+        // previous code treated "has an /Encrypt dictionary at all" as
+        // "ask the user for a password," which is wrong for this very
+        // common case — it should only ask when opening genuinely
+        // requires a password the empty string doesn't satisfy.
+        try {
+          pdfLibDoc = await PDFDocument.load(buf, { password: '' });
+          wasEncrypted = true;
+        } catch {
+          // empty password genuinely doesn't work — this one really
+          // does need the user to enter something
+          set({ pendingEncryptedFile: { name: file.name, bytes: buf }, passwordError: null });
+          return;
+        }
+      } else {
+        throw e;
       }
-      throw e;
     }
     const proxy = await bytesToProxy(buf);
     const doc: OpenDocument = {
@@ -1164,6 +1325,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   createFormField: async (docId, kind, page, xNorm, yNorm, wNorm, hNorm) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    await get().pushStructuralHistory(docId);
 
     const pdfForm = doc.pdfLibDoc.getForm();
     const pdfPage = doc.pdfLibDoc.getPage(page - 1);
@@ -1214,6 +1376,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   deleteFormField: async (docId, fieldName) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    await get().pushStructuralHistory(docId);
     try {
       const pdfForm = doc.pdfLibDoc.getForm();
       const field = pdfForm.getField(fieldName);
@@ -1270,13 +1433,67 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   saveAsWithName: async (docId, newName) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
-    const bytes = await doc.pdfLibDoc.save();
+    const bytes = await get().buildExportBytes(docId);
+    if (!bytes) return;
     const finalName = newName.endsWith('.pdf') ? newName : `${newName}.pdf`;
     downloadBlob(bytes, finalName);
     // reflect the rename in the open tab too
     set((s) => ({
       documents: s.documents.map((d) => (d.id === docId ? { ...d, name: finalName } : d)),
     }));
+  },
+
+  // Real destination-folder picker via the File System Access API — a
+  // standard browser API, not something requiring a separate native
+  // dialog integration. Supported in Chrome/Edge (and therefore the
+  // Windows desktop app too, since it runs on WebView2 — Edge's own
+  // engine); not supported in Firefox or Safari, where this quietly
+  // reports 'unsupported' so the caller can fall back to the existing
+  // filename-only Save As flow.
+  //
+  // The file picker must be requested immediately, before any other
+  // async work — browsers only allow it while "user activation" from
+  // the actual click is still active, and building the full export
+  // (embedding fonts, baking annotations) can take long enough to lose
+  // that window if done first.
+  saveAsToLocation: async (docId) => {
+    const w = window as unknown as {
+      showSaveFilePicker?: (opts: {
+        suggestedName?: string;
+        types?: { description: string; accept: Record<string, string[]> }[];
+      }) => Promise<{
+        createWritable: () => Promise<{ write: (data: Uint8Array) => Promise<void>; close: () => Promise<void> }>;
+        name: string;
+      }>;
+    };
+    if (!w.showSaveFilePicker) return 'unsupported';
+
+    const doc = get().documents.find((d) => d.id === docId);
+    if (!doc) return 'cancelled';
+
+    let handle;
+    try {
+      handle = await w.showSaveFilePicker({
+        suggestedName: doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`,
+        types: [{ description: 'PDF Document', accept: { 'application/pdf': ['.pdf'] } }],
+      });
+    } catch (e) {
+      // AbortError = user closed the dialog without choosing anything —
+      // a normal cancel, not a failure worth surfacing as an error
+      if (e instanceof Error && e.name === 'AbortError') return 'cancelled';
+      throw e;
+    }
+
+    const bytes = await get().buildExportBytes(docId);
+    if (!bytes) return 'cancelled';
+    const writable = await handle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+
+    set((s) => ({
+      documents: s.documents.map((d) => (d.id === docId ? { ...d, name: handle.name } : d)),
+    }));
+    return 'saved';
   },
 
   getDocumentMetadata: (docId) => {
@@ -1728,6 +1945,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   applyCrop: async (docId, pageNum, xNorm, yNorm, wNorm, hNorm) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    await get().pushStructuralHistory(docId);
     const page = doc.pdfLibDoc.getPage(pageNum - 1);
     const { width, height } = page.getSize();
 
@@ -1823,6 +2041,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   rotatePage: async (docId, pageIndex) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    await get().pushStructuralHistory(docId);
     const page = doc.pdfLibDoc.getPage(pageIndex);
     const current = page.getRotation().angle;
     page.setRotation(degrees((current + 90) % 360));
@@ -1838,6 +2057,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   deletePage: async (docId, pageIndex) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc || doc.pdfLibDoc.getPageCount() <= 1) return;
+    await get().pushStructuralHistory(docId);
     doc.pdfLibDoc.removePage(pageIndex);
     const bytes = await doc.pdfLibDoc.save();
     const proxy = await bytesToProxy(bytes);
@@ -1852,6 +2072,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   insertBlankPage: async (docId, afterIndex) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    await get().pushStructuralHistory(docId);
     const ref = doc.pdfLibDoc.getPage(Math.max(0, afterIndex));
     const { width, height } = ref.getSize();
     doc.pdfLibDoc.insertPage(afterIndex + 1, [width, height]);
@@ -1867,6 +2088,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   reorderPage: async (docId, fromIndex, toIndex) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc || fromIndex === toIndex) return;
+    await get().pushStructuralHistory(docId);
     const count = doc.pdfLibDoc.getPageCount();
     const order = Array.from({ length: count }, (_, i) => i);
     const [moved] = order.splice(fromIndex, 1);
@@ -1893,6 +2115,95 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     copied.forEach((p) => newDoc.addPage(p));
     const bytes = await newDoc.save();
     downloadBlob(bytes, `extracted-${range[0]}-${range[range.length - 1]}-${doc.name}`);
+  },
+
+  splitDocument: async (docId, mode, options) => {
+    const doc = get().documents.find((d) => d.id === docId);
+    if (!doc) return { ok: false, error: 'Document not found.' };
+    const pageCount = doc.pdfLibDoc.getPageCount();
+
+    // Each entry is one output file, as a list of 1-indexed page numbers.
+    let groups: number[][] = [];
+
+    if (mode === 'every-page') {
+      groups = Array.from({ length: pageCount }, (_, i) => [i + 1]);
+    } else if (mode === 'every-n') {
+      const n = Math.max(1, Math.floor(options.n ?? 1));
+      for (let start = 1; start <= pageCount; start += n) {
+        const end = Math.min(start + n - 1, pageCount);
+        groups.push(Array.from({ length: end - start + 1 }, (_, i) => start + i));
+      }
+    } else {
+      // ranges — e.g. "1-3, 5, 7-9"
+      const raw = (options.ranges ?? '').trim();
+      if (!raw) return { ok: false, error: 'Enter at least one page or range, e.g. "1-3, 5, 7-9".' };
+      const segments = raw.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const seg of segments) {
+        const rangeMatch = seg.match(/^(\d+)\s*-\s*(\d+)$/);
+        const singleMatch = seg.match(/^(\d+)$/);
+        if (rangeMatch) {
+          const start = Number(rangeMatch[1]);
+          const end = Number(rangeMatch[2]);
+          if (start < 1 || end > pageCount || start > end) {
+            return {
+              ok: false,
+              error: `"${seg}" is not a valid range for this ${pageCount}-page document.`,
+            };
+          }
+          groups.push(Array.from({ length: end - start + 1 }, (_, i) => start + i));
+        } else if (singleMatch) {
+          const p = Number(singleMatch[1]);
+          if (p < 1 || p > pageCount) {
+            return {
+              ok: false,
+              error: `Page ${p} is out of range for this ${pageCount}-page document.`,
+            };
+          }
+          groups.push([p]);
+        } else {
+          return {
+            ok: false,
+            error: `Could not understand "${seg}" — use page numbers and ranges like "1-3, 5, 7-9".`,
+          };
+        }
+      }
+    }
+
+    if (groups.length === 0) return { ok: false, error: 'Nothing to split — the document has no pages.' };
+
+    const baseName = doc.name.replace(/\.pdf$/i, '');
+    const padWidth = String(groups.length).length;
+
+    // A single output file downloads directly; more than one is bundled
+    // into a zip — same convention already used for multi-page PNG export.
+    if (groups.length === 1) {
+      const newDoc = await PDFDocument.create();
+      const copied = await newDoc.copyPages(doc.pdfLibDoc, groups[0].map((p) => p - 1));
+      copied.forEach((p) => newDoc.addPage(p));
+      const bytes = await newDoc.save();
+      downloadBlob(bytes, `${baseName}-p${groups[0][0]}-${groups[0][groups[0].length - 1]}.pdf`);
+      return { ok: true, fileCount: 1 };
+    }
+
+    const zip = new JSZip();
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const newDoc = await PDFDocument.create();
+      const copied = await newDoc.copyPages(doc.pdfLibDoc, group.map((p) => p - 1));
+      copied.forEach((p) => newDoc.addPage(p));
+      const bytes = await newDoc.save();
+      const label =
+        group.length === 1 ? `p${group[0]}` : `p${group[0]}-${group[group.length - 1]}`;
+      zip.file(`${baseName}-${String(i + 1).padStart(padWidth, '0')}-${label}.pdf`, bytes);
+    }
+    const zipBlob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(zipBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}-split.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+    return { ok: true, fileCount: groups.length };
   },
 
   mergeAllOpenDocuments: async () => {
@@ -1922,9 +2233,92 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     }));
   },
 
+  // Merges files picked directly (they don't need to already be open as
+  // tabs first, unlike Combine Open Files above) in exactly the given
+  // order. Each file is loaded the same careful way regular Open does —
+  // trying an empty password automatically for files that are encrypted
+  // but don't actually need one to open (see the false-"Password
+  // Protected"-prompt fix) — so a permissions-only-restricted invoice
+  // PDF doesn't wrongly get treated as unreadable here either. A file
+  // that's genuinely unreadable (real password, corrupted) is skipped
+  // with the rest reported back, rather than failing the whole merge.
+  mergeSelectedFiles: async (files) => {
+    if (files.length < 2) return { ok: false, error: 'Choose at least 2 PDF files to merge.' };
+
+    const newDoc = await PDFDocument.create();
+    const skipped: string[] = [];
+
+    for (const file of files) {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      let loaded: PDFDocument;
+      try {
+        loaded = await PDFDocument.load(buf, { ignoreEncryption: false });
+      } catch (e) {
+        if (e instanceof EncryptedPDFError) {
+          try {
+            loaded = await PDFDocument.load(buf, { password: '' });
+          } catch {
+            skipped.push(file.name);
+            continue;
+          }
+        } else {
+          skipped.push(file.name);
+          continue;
+        }
+      }
+      try {
+        const indices = Array.from({ length: loaded.getPageCount() }, (_, i) => i);
+        const copied = await newDoc.copyPages(loaded, indices);
+        copied.forEach((p) => newDoc.addPage(p));
+      } catch {
+        skipped.push(file.name);
+      }
+    }
+
+    if (newDoc.getPageCount() === 0) {
+      return { ok: false, error: 'None of the selected files could be read.' };
+    }
+
+    const bytes = await newDoc.save();
+    const proxy = await bytesToProxy(bytes);
+    const merged: OpenDocument = {
+      id: `merged-${Date.now()}`,
+      name: 'Merged.pdf',
+      pdfLibDoc: newDoc,
+      proxy,
+      pageCount: proxy.numPages,
+      wasEncrypted: false,
+    };
+    set((s) => ({
+      documents: [...s.documents, merged],
+      activeId: merged.id,
+      currentPage: 1,
+      annotations: { ...s.annotations, [merged.id]: {} },
+    }));
+    downloadBlob(bytes, 'Merged.pdf');
+    return { ok: true, skipped };
+  },
+
   exportDocument: async (docId) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return;
+    const outBytes = await get().buildExportBytes(docId);
+    if (!outBytes) return;
+    downloadBlob(outBytes, doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`);
+  },
+
+  // The real, full export: clones the document, embeds every font actually
+  // used, and bakes in every annotation (highlights, text boxes, ink,
+  // notes, images), the invisible OCR text layer, and any direct line
+  // edits. This used to live directly inside exportDocument, which meant
+  // "Save" got all of this but "Save As" — which called a separate,
+  // much simpler path — silently skipped all of it. Pulling it out into
+  // its own function that both Save and Save As call is what actually
+  // fixes that: there's now only one place this logic can exist, so the
+  // two can't drift apart again.
+  buildExportBytes: async (docId) => {
+    const doc = get().documents.find((d) => d.id === docId);
+    if (!doc) return null;
 
     // Clone the current pdf-lib doc so the in-app working copy (and undo/redo)
     // stays untouched — annotations are only "burned in" on the export copy.
@@ -2171,8 +2565,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       }
     }
 
-    const outBytes = await exportDoc.save();
-    downloadBlob(outBytes, doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`);
+    return exportDoc.save();
   },
 
   exportToWord: async (docId) => {
@@ -2527,6 +2920,78 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     );
     if (pagesToFlatten.length === 0) return;
 
+    // Erase/redact marks only ever whited out the underlying PAGE PIXELS
+    // (whatever pdf.js originally rendered there) — they never touched
+    // our own annotations (text boxes, ink lines, highlights, images,
+    // notes), which are separate overlay objects drawn on top. So typing
+    // new text or drawing a line, then erasing over it, correctly whited
+    // out the page underneath but left the overlay object sitting there
+    // unchanged, which just looked like the erase had failed. Fixed by
+    // also removing any of our own overlapping annotations here, using
+    // each type's actual geometry (a point-containment check for
+    // anchor-only shapes like text boxes/notes/ink points, a real
+    // rectangle-overlap test for anything with real width/height).
+    //
+    // A second, separate case exists too, and was still broken after the
+    // first fix: text edited on an *existing* PDF line via the Edit tool
+    // (as opposed to a new Type Text box) doesn't live in the annotations
+    // array at all — it's tracked in lineEdits/lineStyleOverrides,
+    // rendered from pageLines' cached line geometry. Erasing over an
+    // edited line needs to clear those entries too, or the edit just
+    // keeps rendering from its own separate overlay, unaffected by
+    // anything that only ever looked at `annotations`.
+    const annotationsAfterErase: Record<number, Annotation[]> = { ...docAnns };
+    const lineEditsAfterErase: Record<number, Record<number, string>> = { ...docLineEdits };
+    const styleOverridesAfterErase: Record<number, Record<number, Partial<LineStyleOverride>>> = {
+      ...docStyleOverrides,
+    };
+    for (const pageNum of redactionPages) {
+      const marks = (docAnns[pageNum] ?? []).filter(
+        (a): a is RedactionAnnotation => a.type === 'redact' && !a.applied
+      );
+      if (marks.length === 0) continue;
+
+      const rectsOverlap = (x: number, y: number, w: number, h: number) =>
+        marks.some((m) => x < m.x + m.w && x + w > m.x && y < m.y + m.h && y + h > m.y);
+      const pointInsideAnyMark = (x: number, y: number) =>
+        marks.some((m) => x >= m.x && x <= m.x + m.w && y >= m.y && y <= m.y + m.h);
+
+      annotationsAfterErase[pageNum] = (annotationsAfterErase[pageNum] ?? []).filter((a: Annotation) => {
+        if (a.type === 'redact') return true; // the marks themselves are handled by the baking loop below
+        if (a.type === 'text' || a.type === 'note') return !pointInsideAnyMark(a.x, a.y);
+        if (a.type === 'ink') return !a.points.some((p: { x: number; y: number }) => pointInsideAnyMark(p.x, p.y));
+        if (a.type === 'highlight' || a.type === 'image') return !rectsOverlap(a.x, a.y, a.w, a.h);
+        return true;
+      });
+
+      const linesOnPage = docLines[pageNum] ?? [];
+      const editedLineIndices = new Set([
+        ...Object.keys(lineEditsAfterErase[pageNum] ?? {}).map(Number),
+        ...Object.keys(styleOverridesAfterErase[pageNum] ?? {}).map(Number),
+      ]);
+      for (const idx of editedLineIndices) {
+        const line = linesOnPage[idx];
+        if (!line) continue;
+        if (rectsOverlap(line.x, line.yTop, line.w, line.h)) {
+          if (lineEditsAfterErase[pageNum]) {
+            const { [idx]: _drop, ...rest } = lineEditsAfterErase[pageNum];
+            lineEditsAfterErase[pageNum] = rest;
+          }
+          if (styleOverridesAfterErase[pageNum]) {
+            const { [idx]: _drop2, ...rest2 } = styleOverridesAfterErase[pageNum];
+            styleOverridesAfterErase[pageNum] = rest2;
+          }
+        }
+      }
+    }
+    if (redactionPages.length > 0) {
+      set({
+        annotations: { ...get().annotations, [docId]: annotationsAfterErase },
+        lineEdits: { ...get().lineEdits, [docId]: lineEditsAfterErase },
+        lineStyleOverrides: { ...get().lineStyleOverrides, [docId]: styleOverridesAfterErase },
+      });
+    }
+
     set({ ocrProgress: { active: true, label: 'Applying changes', pct: 0 } });
 
     const newDoc = await PDFDocument.create();
@@ -2537,8 +3002,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const redactionsHere = (docAnns[pageNum] ?? []).filter(
         (a): a is RedactionAnnotation => a.type === 'redact' && !a.applied
       );
-      const editsHere = docLineEdits[pageNum] ?? {};
-      const styleOverridesHere = docStyleOverrides[pageNum] ?? {};
+      const editsHere = lineEditsAfterErase[pageNum] ?? {};
+      const styleOverridesHere = styleOverridesAfterErase[pageNum] ?? {};
       const linesHere = docLines[pageNum] ?? [];
       const hasEdits = Object.keys(editsHere).length > 0 || Object.keys(styleOverridesHere).length > 0;
 
@@ -2609,36 +3074,64 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
           const px = line.x * viewport.width;
           const py = line.yTop * viewport.height;
-          const pw = Math.max(line.w * viewport.width, 4);
           const ph = line.h * viewport.height;
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(px - 2, py - 2, pw + 4, ph + 4);
+
+          // Font/text-stack setup moved up here, before the cover rect is
+          // sized — needed so the actual rendered width of the *new* text
+          // can be measured first. This is the real bug behind "the edges
+          // are going out": the cover rect's width was only ever computed
+          // from the ORIGINAL line's detected width (line.w), never from
+          // how long the actual edited text turned out to be. Appending
+          // text (e.g. "Your trip" -> "Your trip To Dubai on 2026") made
+          // the real text far wider than that original width, so the
+          // overflow portion rendered directly onto un-recolored original
+          // pixels the cover never touched — visible as content "going
+          // out" past a correctly-colored patch that was simply too narrow.
+          const fontPx = override?.fontSize ? effectiveFontSizePt * scale : (ph / 1.3) * 0.92;
+          const canvasFontStack =
+            effectiveFamily === 'TimesRoman'
+              ? '"Times New Roman", Times, serif'
+              : effectiveFamily === 'Courier'
+              ? '"Courier New", Courier, monospace'
+              : effectiveFamily === 'Poppins'
+              ? '"PDFSuite Poppins", Arial, sans-serif'
+              : effectiveFamily === 'Montserrat'
+              ? '"PDFSuite Montserrat", Arial, sans-serif'
+              : effectiveFamily === 'Roboto'
+              ? '"PDFSuite Roboto", Arial, sans-serif'
+              : effectiveFamily === 'OpenSans'
+              ? '"PDFSuite OpenSans", Arial, sans-serif'
+              : effectiveFamily === 'Merriweather'
+              ? '"PDFSuite Merriweather", Georgia, serif'
+              : 'Helvetica, Arial, sans-serif';
+          const weightPrefix = effectiveBold ? 'bold ' : '';
+          const stylePrefix = effectiveItalic ? 'italic ' : '';
+          ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
+          const measuredTextWidth = newText.trim() ? ctx.measureText(newText).width : 0;
+          const pw = Math.max(line.w * viewport.width, measuredTextWidth, 4);
+
+          // Sample the real background right here, before covering it —
+          // the canvas still holds the untouched original render at this
+          // point, so this reads whatever was actually behind the text
+          // (a colored banner, a shaded row, or plain white) rather than
+          // assuming white and breaking visibly on anything else.
+          //
+          // Snapped to whole device pixels with floor/ceil, same fix
+          // already proven for the redaction fill elsewhere in this
+          // function — a fixed-but-fractional pixel padding (the old
+          // "-2 / +4") doesn't actually guarantee full coverage, since
+          // padding a fractional coordinate can still land on a fraction.
+          const cx0 = Math.floor(px) - 2;
+          const cy0 = Math.floor(py) - 2;
+          const cx1 = Math.ceil(px + pw) + 2;
+          const cy1 = Math.ceil(py + ph) + 2;
+          ctx.fillStyle = sampleBoxBackgroundColor(ctx, cx0, cy0, cx1 - cx0, cy1 - cy0);
+          ctx.fillRect(cx0, cy0, cx1 - cx0, cy1 - cy0);
           if (newText.trim()) {
-            // font size scales with the line's own detected box height by
-            // default, but an explicit override (in real points) takes
-            // priority and is converted using the same points-per-device-
-            // pixel ratio as the rest of this render
-            const fontPx = override?.fontSize
-              ? effectiveFontSizePt * scale
-              : (ph / 1.3) * 0.92;
             ctx.fillStyle = line.color || '#000000';
-            const canvasFontStack =
-              effectiveFamily === 'TimesRoman'
-                ? '"Times New Roman", Times, serif'
-                : effectiveFamily === 'Courier'
-                ? '"Courier New", Courier, monospace'
-                : effectiveFamily === 'Poppins'
-                ? '"PDFSuite Poppins", Arial, sans-serif'
-                : effectiveFamily === 'Montserrat'
-                ? '"PDFSuite Montserrat", Arial, sans-serif'
-                : effectiveFamily === 'Roboto'
-                ? '"PDFSuite Roboto", Arial, sans-serif'
-                : 'Helvetica, Arial, sans-serif';
-            const weightPrefix = effectiveBold ? 'bold ' : '';
-            const stylePrefix = effectiveItalic ? 'italic ' : '';
             ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
             ctx.textBaseline = 'alphabetic';
-            const textY = py + ph * 0.82;
+            const textY = py + ph * LINE_BASELINE_RATIO;
             ctx.fillText(newText, px, textY);
             if (effectiveUnderline) {
               const textWidth = ctx.measureText(newText).width;
@@ -2726,8 +3219,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
   // ---------- Annotations ----------
   addAnnotation: (docId, annotation) => {
-    const { annotations, lineEdits, undoStack } = get();
-    set({ undoStack: [...undoStack, { annotations, lineEdits }], redoStack: [] });
+    const { annotations, lineEdits, lineStyleOverrides, undoStack } = get();
+    set({ undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides }], redoStack: [] });
     const docAnns = { ...(annotations[docId] ?? {}) };
     const pageAnns = [...(docAnns[annotation.page] ?? []), annotation];
     docAnns[annotation.page] = pageAnns;
@@ -2819,8 +3312,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   deleteAnnotation: (docId, page, id) => {
-    const { annotations, lineEdits, undoStack } = get();
-    set({ undoStack: [...undoStack, { annotations, lineEdits }], redoStack: [] });
+    const { annotations, lineEdits, lineStyleOverrides, undoStack } = get();
+    set({ undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides }], redoStack: [] });
     const docAnns = { ...(annotations[docId] ?? {}) };
     docAnns[page] = (docAnns[page] ?? []).filter((a) => a.id !== id);
     set({ annotations: { ...annotations, [docId]: docAnns } });
@@ -2838,8 +3331,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const pageHeightPts = page.view[3] - page.view[1];
 
       const cached: CachedLine[] = rawLines.map((l, idx) => {
-        const lineHeightPt = l.fontSize * 1.3;
-        const topPt = pageHeightPts - l.y - l.fontSize * 1.05; // approx top of glyph box
+        const lineHeightPt = l.fontSize * LINE_HEIGHT_MULT;
+        const topPt = pageHeightPts - l.y - l.fontSize * ASCENT_MULT; // approx top of glyph box
         return {
           index: idx,
           text: l.text,
@@ -2893,8 +3386,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   setLineEdit: (docId, page, lineIndex, text) => {
-    const { annotations, lineEdits, undoStack } = get();
-    set({ undoStack: [...undoStack, { annotations, lineEdits }], redoStack: [] });
+    const { annotations, lineEdits, lineStyleOverrides, undoStack } = get();
+    set({ undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides }], redoStack: [] });
     const docEdits = { ...(lineEdits[docId] ?? {}) };
     docEdits[page] = { ...(docEdits[page] ?? {}), [lineIndex]: text };
     set({ lineEdits: { ...lineEdits, [docId]: docEdits } });
@@ -2911,27 +3404,90 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
   setActiveEditLine: (line) => set({ activeEditLine: line }),
 
-  undo: () => {
-    const { undoStack, redoStack, annotations, lineEdits } = get();
-    if (undoStack.length === 0) return;
-    const prev = undoStack[undoStack.length - 1];
+  pushStructuralHistory: async (docId) => {
+    const { documents, annotations, lineEdits, lineStyleOverrides, undoStack } = get();
+    const doc = documents.find((d) => d.id === docId);
+    if (!doc) return;
+    const bytes = await doc.pdfLibDoc.save();
     set({
-      annotations: prev.annotations,
-      lineEdits: prev.lineEdits,
-      undoStack: undoStack.slice(0, -1),
-      redoStack: [...redoStack, { annotations, lineEdits }],
+      undoStack: [
+        ...undoStack,
+        { annotations, lineEdits, lineStyleOverrides, pdfSnapshot: { docId, bytes } },
+      ],
+      redoStack: [],
     });
   },
 
-  redo: () => {
-    const { undoStack, redoStack, annotations, lineEdits } = get();
+  undo: async () => {
+    const { undoStack, redoStack, annotations, lineEdits, lineStyleOverrides, documents } = get();
+    if (undoStack.length === 0) return;
+    const prev = undoStack[undoStack.length - 1];
+
+    let redoSnapshot: HistoryEntry['pdfSnapshot'];
+    let nextDocuments = documents;
+
+    if (prev.pdfSnapshot) {
+      const { docId, bytes } = prev.pdfSnapshot;
+      const doc = documents.find((d) => d.id === docId);
+      if (doc) {
+        // capture where we're moving away FROM, so redo can put it back
+        const currentBytes = await doc.pdfLibDoc.save();
+        redoSnapshot = { docId, bytes: currentBytes };
+        const restoredPdfDoc = await PDFDocument.load(bytes);
+        const proxy = await bytesToProxy(bytes);
+        nextDocuments = documents.map((d) =>
+          d.id === docId
+            ? { ...d, pdfLibDoc: restoredPdfDoc, proxy, pageCount: proxy.numPages }
+            : d
+        );
+        // form fields, if any, were detected from the now-stale document —
+        // refresh them against the restored one
+        await get().loadFormFields(docId);
+      }
+    }
+
+    set({
+      documents: nextDocuments,
+      annotations: prev.annotations,
+      lineEdits: prev.lineEdits,
+      lineStyleOverrides: prev.lineStyleOverrides,
+      undoStack: undoStack.slice(0, -1),
+      redoStack: [...redoStack, { annotations, lineEdits, lineStyleOverrides, pdfSnapshot: redoSnapshot }],
+    });
+  },
+
+  redo: async () => {
+    const { undoStack, redoStack, annotations, lineEdits, lineStyleOverrides, documents } = get();
     if (redoStack.length === 0) return;
     const next = redoStack[redoStack.length - 1];
+
+    let undoSnapshot: HistoryEntry['pdfSnapshot'];
+    let nextDocuments = documents;
+
+    if (next.pdfSnapshot) {
+      const { docId, bytes } = next.pdfSnapshot;
+      const doc = documents.find((d) => d.id === docId);
+      if (doc) {
+        const currentBytes = await doc.pdfLibDoc.save();
+        undoSnapshot = { docId, bytes: currentBytes };
+        const restoredPdfDoc = await PDFDocument.load(bytes);
+        const proxy = await bytesToProxy(bytes);
+        nextDocuments = documents.map((d) =>
+          d.id === docId
+            ? { ...d, pdfLibDoc: restoredPdfDoc, proxy, pageCount: proxy.numPages }
+            : d
+        );
+        await get().loadFormFields(docId);
+      }
+    }
+
     set({
+      documents: nextDocuments,
       annotations: next.annotations,
       lineEdits: next.lineEdits,
+      lineStyleOverrides: next.lineStyleOverrides,
       redoStack: redoStack.slice(0, -1),
-      undoStack: [...undoStack, { annotations, lineEdits }],
+      undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides, pdfSnapshot: undoSnapshot }],
     });
   },
 }));

@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "PDF Suite Pro",
-  "version": "1.2.11",
+  "version": "2.0.8",
   "identifier": "com.adlabs.pdfsuite",
   "build": {
     "frontendDist": "../dist",
@@ -25,13 +25,31 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/anoodh-web/pdfsuite/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI5QzRFMUI0NjYyOEI0RDYKUldUV3RDaG10T0hFdVdGTW5xZWMrK3M0Rkdjc0F1V0kzeUE0SGtocVJiMVpHWlM3bnA5K1ZVNk0K"
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "publisher": "AD Labs",
     "copyright": "Copyright (c) 2026 AD Labs",
     "shortDescription": "Enterprise PDF management suite",
     "longDescription": "PDF Suite Pro — view, edit, convert, secure, and sign PDF documents. Developed and engineered by AD Labs.",
+    "fileAssociations": [
+      {
+        "ext": ["pdf"],
+        "name": "PDF Document",
+        "description": "PDF Document",
+        "mimeType": "application/pdf",
+        "role": "Editor"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

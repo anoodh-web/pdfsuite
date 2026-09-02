@@ -9,6 +9,7 @@ import PasswordPrompt from './components/PasswordPrompt';
 import BottomDock from './components/BottomDock';
 import Toast from './components/Toast';
 import OnboardingPrompt from './components/OnboardingPrompt';
+import FileAssociationHandler from './components/FileAssociationHandler';
 import { useDocumentStore } from './store/useDocumentStore';
 
 export default function App() {
@@ -39,6 +40,7 @@ export default function App() {
       <StatusBar />
       <PasswordPrompt />
       <Toast />
+      <FileAssociationHandler />
       {!userProfile && !onboardingDismissed && (
         <OnboardingPrompt onDone={() => setOnboardingDismissed(true)} />
       )}

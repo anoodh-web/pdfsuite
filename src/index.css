@@ -36,6 +36,45 @@
   src: url('/fonts/Roboto-Regular.ttf') format('truetype');
   font-display: swap;
 }
+@font-face {
+  font-family: 'PDFSuite OpenSans';
+  src: url('/fonts/OpenSans-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Merriweather';
+  src: url('/fonts/Merriweather-Regular.ttf') format('truetype');
+  font-display: swap;
+}
+
+/* Signature script fonts — used only in the Type Signature modal, where
+   a signature is drawn/typed then captured as an image, so these only
+   ever need to render correctly on screen (no PDF font embedding). */
+@font-face {
+  font-family: 'PDFSuite DancingScript';
+  src: url('/fonts/DancingScript.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite GreatVibes';
+  src: url('/fonts/GreatVibes.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Pacifico';
+  src: url('/fonts/Pacifico.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite AlexBrush';
+  src: url('/fonts/AlexBrush.ttf') format('truetype');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PDFSuite Sacramento';
+  src: url('/fonts/Sacramento.ttf') format('truetype');
+  font-display: swap;
+}
 
 /* Theme tokens. Colors are stored as "R G B" triplets (not hex) so Tailwind's
    opacity-modifier classes (e.g. bg-accent/20) work via rgb(var(--x) / alpha).

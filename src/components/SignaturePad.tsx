@@ -9,10 +9,23 @@ interface Props {
   onCancel: () => void;
 }
 
-function renderTypedSignature(text: string) {
+// Real script/handwriting fonts for typed signatures — bundled the same
+// way as the rest of the app's custom fonts, not relying on whatever
+// cursive-ish system font happens to be installed (which varies a lot
+// across Windows/macOS/Linux and often isn't very signature-like at all).
+export const SIGNATURE_FONTS = [
+  { value: 'DancingScript', label: 'Dancing Script', css: '"PDFSuite DancingScript", cursive' },
+  { value: 'GreatVibes', label: 'Great Vibes', css: '"PDFSuite GreatVibes", cursive' },
+  { value: 'Pacifico', label: 'Pacifico', css: '"PDFSuite Pacifico", cursive' },
+  { value: 'AlexBrush', label: 'Alex Brush', css: '"PDFSuite AlexBrush", cursive' },
+  { value: 'Sacramento', label: 'Sacramento', css: '"PDFSuite Sacramento", cursive' },
+] as const;
+export type SignatureFont = (typeof SIGNATURE_FONTS)[number]['value'];
+
+function renderTypedSignature(text: string, fontCss: string) {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d')!;
-  const fontSpec = '52px "Segoe Script", "Brush Script MT", "Comic Sans MS", cursive';
+  const fontSpec = `52px ${fontCss}`;
   ctx.font = fontSpec;
   const metrics = ctx.measureText(text || 'Signature');
   canvas.width = Math.max(60, Math.ceil(metrics.width) + 24);
@@ -58,6 +71,7 @@ export default function SignaturePad({ onConfirm, onCancel }: Props) {
   const drawing = useRef(false);
   const hasStroke = useRef(false);
   const [typedText, setTypedText] = useState('');
+  const [signatureFont, setSignatureFont] = useState<SignatureFont>('DancingScript');
   const [uploaded, setUploaded] = useState<{ dataUrl: string; w: number; h: number } | null>(
     null
   );
@@ -125,7 +139,8 @@ export default function SignaturePad({ onConfirm, onCancel }: Props) {
 
   const confirmTyped = () => {
     if (!typedText.trim()) return;
-    const { dataUrl, w, h } = renderTypedSignature(typedText.trim());
+    const fontCss = SIGNATURE_FONTS.find((f) => f.value === signatureFont)!.css;
+    const { dataUrl, w, h } = renderTypedSignature(typedText.trim(), fontCss);
     onConfirm(dataUrl, w, h);
   };
 
@@ -142,7 +157,10 @@ export default function SignaturePad({ onConfirm, onCancel }: Props) {
         h: canvasRef.current.height,
       };
     }
-    if (tab === 'type' && typedText.trim()) return renderTypedSignature(typedText.trim());
+    if (tab === 'type' && typedText.trim()) {
+      const fontCss = SIGNATURE_FONTS.find((f) => f.value === signatureFont)!.css;
+      return renderTypedSignature(typedText.trim(), fontCss);
+    }
     if (tab === 'upload' && uploaded) return uploaded;
     return null;
   };
@@ -205,8 +223,25 @@ export default function SignaturePad({ onConfirm, onCancel }: Props) {
                 onChange={(e) => setTypedText(e.target.value)}
                 placeholder="Type your full name"
                 className="w-full rounded border border-ink-500 bg-white px-3 py-3 text-lg text-black focus:outline-none"
-                style={{ fontFamily: '"Segoe Script","Brush Script MT",cursive' }}
+                style={{ fontFamily: SIGNATURE_FONTS.find((f) => f.value === signatureFont)!.css }}
               />
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {SIGNATURE_FONTS.map((f) => (
+                  <button
+                    key={f.value}
+                    onClick={() => setSignatureFont(f.value)}
+                    style={{ fontFamily: f.css }}
+                    className={`rounded border px-2.5 py-1 text-sm ${
+                      signatureFont === f.value
+                        ? 'border-accent bg-accent-soft text-accent'
+                        : 'border-ink-500 text-paper/80 hover:border-ink-400'
+                    }`}
+                    title={f.label}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
             </>
           )}
 
