@@ -25,6 +25,7 @@ import {
   Highlighter,
   StickyNote,
   PenLine,
+  Circle,
   FilePlus,
   Download,
   ScanText,
@@ -630,6 +631,8 @@ export default function Ribbon() {
               <RibbonButton icon={Highlighter} label="Highlight" large active={activeTool === 'highlight'} onClick={() => setActiveTool('highlight')} />
               <RibbonButton icon={StickyNote} label="Sticky Note" large active={activeTool === 'note'} onClick={() => setActiveTool('note')} />
               <RibbonButton icon={PenLine} label="Ink" large active={activeTool === 'ink'} onClick={() => setActiveTool('ink')} />
+              <RibbonButton icon={Check} label="Tick" large active={activeTool === 'stamp-tick'} onClick={() => setActiveTool('stamp-tick')} />
+              <RibbonButton icon={Circle} label="Dot" large active={activeTool === 'stamp-dot'} onClick={() => setActiveTool('stamp-dot')} />
               <RibbonButton icon={MousePointer2} label="Select" large active={activeTool === 'select'} onClick={() => setActiveTool('select')} />
             </RibbonGroup>
             <RibbonGroup title="Edit & Erase">

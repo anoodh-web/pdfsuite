@@ -31,6 +31,52 @@ export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
+
+  // Custom smooth drag — replaces HTML5's native draggable/onDragEnd,
+  // which only updates position once, on drop: the browser shows its own
+  // semi-transparent "ghost" following the cursor in the meantime, and the
+  // real element just jumps to its final spot at the end. That gap between
+  // what you see while dragging and what actually moves is exactly what
+  // "clumsy" describes. This tracks the pointer directly with real mouse
+  // events and calls onMove continuously, so the actual element follows
+  // the cursor in real time — smooth and precise, matching how a
+  // purpose-built editor like Sejda behaves, not a fallback browser drag.
+  const dragMovedRef = useRef(false);
+  const startSmoothDrag = useCallback(
+    (
+      e: React.MouseEvent,
+      currentXNorm: number,
+      currentYNorm: number,
+      onMove: (xNorm: number, yNorm: number) => void
+    ) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const overlay = overlayRef.current;
+      if (!overlay) return;
+      dragMovedRef.current = false;
+      const startRect = overlay.getBoundingClientRect();
+      // preserve exactly where within the element the user grabbed it, so
+      // it doesn't jump to align its corner with the cursor
+      const grabOffsetX = e.clientX - startRect.left - currentXNorm * startRect.width;
+      const grabOffsetY = e.clientY - startRect.top - currentYNorm * startRect.height;
+
+      const handleMove = (ev: MouseEvent) => {
+        dragMovedRef.current = true;
+        const rect = overlay.getBoundingClientRect();
+        const x = (ev.clientX - rect.left - grabOffsetX) / rect.width;
+        const y = (ev.clientY - rect.top - grabOffsetY) / rect.height;
+        onMove(x, y);
+      };
+      const handleUp = () => {
+        window.removeEventListener('mousemove', handleMove);
+        window.removeEventListener('mouseup', handleUp);
+      };
+      window.addEventListener('mousemove', handleMove);
+      window.addEventListener('mouseup', handleUp);
+    },
+    []
+  );
+
   const {
     documents,
     activeId,
@@ -207,6 +253,64 @@ export default function Canvas() {
       }
 
       if (!typing && doc) {
+        const isArrow =
+          e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'ArrowRight';
+
+        // If something's actually selected, arrow keys nudge it instead of
+        // changing pages — the requested keyboard-move behavior. Only
+        // text, note, and image annotations support repositioning at all
+        // (highlights/ink are drawn shapes, not simple x/y boxes), so this
+        // only takes over for those types; anything else falls through to
+        // the normal page-navigation behavior below.
+        const selected = selectedAnnotationId
+          ? pageAnnotations.find((a) => a.id === selectedAnnotationId)
+          : undefined;
+        const nudgeable =
+          selected && (selected.type === 'text' || selected.type === 'note' || selected.type === 'image');
+
+        if (isArrow && nudgeable && selected) {
+          e.preventDefault();
+          // a small step normally, a much bigger one with Shift held —
+          // same convention as Figma and most design tools
+          const step = (e.shiftKey ? 0.01 : 0.0015) * (zoom ? 1 / zoom : 1);
+          let dx = 0;
+          let dy = 0;
+          if (e.key === 'ArrowUp') dy = -step;
+          else if (e.key === 'ArrowDown') dy = step;
+          else if (e.key === 'ArrowLeft') dx = -step;
+          else if (e.key === 'ArrowRight') dx = step;
+
+          const nextX = selected.x + dx;
+          const nextY = selected.y + dy;
+
+          if (selected.type === 'text') {
+            updateTextBoxPosition(
+              doc.id,
+              currentPage,
+              selected.id,
+              Math.max(0, Math.min(0.95, nextX)),
+              Math.max(0, Math.min(0.95, nextY))
+            );
+          } else if (selected.type === 'note') {
+            updateNotePosition(
+              doc.id,
+              currentPage,
+              selected.id,
+              Math.max(0, Math.min(1, nextX)),
+              Math.max(0, Math.min(1, nextY))
+            );
+          } else if (selected.type === 'image') {
+            updateImagePosition(
+              doc.id,
+              currentPage,
+              selected.id,
+              Math.max(0, Math.min(1 - selected.w, nextX)),
+              Math.max(0, Math.min(1 - selected.h, nextY))
+            );
+          }
+          return;
+        }
+
         if (e.key === 'ArrowDown' || e.key === 'PageDown') {
           e.preventDefault();
           setCurrentPage(Math.min(doc.pageCount, currentPage + 1));
@@ -219,7 +323,21 @@ export default function Canvas() {
 
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [doc, currentPage, selectedAnnotationId, activeTool, undo, redo, deleteAnnotation, setCurrentPage]);
+  }, [
+    doc,
+    currentPage,
+    selectedAnnotationId,
+    activeTool,
+    undo,
+    redo,
+    deleteAnnotation,
+    setCurrentPage,
+    pageAnnotations,
+    zoom,
+    updateTextBoxPosition,
+    updateNotePosition,
+    updateImagePosition,
+  ]);
 
   // Mouse-wheel page navigation: scrolling down/up steps to the next/previous
   // page (this viewer shows one page at a time rather than a continuously
@@ -377,6 +495,32 @@ export default function Canvas() {
       };
       addAnnotation(doc.id, note);
       setOpenNoteId(note.id);
+    } else if (activeTool === 'stamp-tick' || activeTool === 'stamp-dot') {
+      // Quick-stamp tools for filling non-interactive/flat forms — the
+      // printed boxes and circles on a scanned form aren't real fields,
+      // just ink on the page, so there's nothing to click "into" in the
+      // way a real checkbox works. This places a checkmark or dot exactly
+      // where clicked, immediately (no typing step), sized to be legible
+      // sitting inside a typical printed box. It's a text annotation under
+      // the hood, so it's draggable and nudgeable with arrow keys exactly
+      // like any other text box, in case the placement needs adjusting.
+      const glyph = activeTool === 'stamp-tick' ? '\u2713' : '\u25CF';
+      const stamp: Annotation = {
+        id: uid(),
+        type: 'text',
+        page: currentPage,
+        color: annotationColor,
+        x: pos.x,
+        y: pos.y,
+        text: glyph,
+        fontSize: activeTool === 'stamp-dot' ? Math.max(10, textFontSize * 0.6) : textFontSize,
+        fontFamily: 'Helvetica',
+        bold: true,
+        italic: false,
+        underline: false,
+      };
+      addAnnotation(doc.id, stamp);
+      setSelectedAnnotationId(stamp.id);
     } else if (activeTool === 'type-text') {
       const box: Annotation = {
         id: uid(),
@@ -541,6 +685,8 @@ export default function Canvas() {
       : activeTool === 'note' ||
         activeTool === 'type-text' ||
         activeTool === 'signature' ||
+        activeTool === 'stamp-tick' ||
+        activeTool === 'stamp-dot' ||
         activeTool === 'form-text' ||
         activeTool === 'form-checkbox' ||
         activeTool === 'form-radio' ||
@@ -754,26 +900,22 @@ export default function Canvas() {
                   style={{ left: `${a.x * 100}%`, top: `${a.y * 100}%` }}
                 >
                   <button
-                    draggable
                     onMouseDown={(e) => {
                       e.stopPropagation();
                       setSelectedAnnotationId(a.id);
-                    }}
-                    onDragEnd={(e) => {
-                      if (e.clientX === 0 && e.clientY === 0) return; // dropped outside the page
-                      const rect = overlayRef.current!.getBoundingClientRect();
-                      const x = (e.clientX - rect.left) / rect.width;
-                      const y = (e.clientY - rect.top) / rect.height;
-                      updateNotePosition(
-                        doc.id,
-                        currentPage,
-                        a.id,
-                        Math.max(0, Math.min(1, x)),
-                        Math.max(0, Math.min(1, y))
-                      );
+                      startSmoothDrag(e, a.x, a.y, (x, y) => {
+                        updateNotePosition(
+                          doc.id,
+                          currentPage,
+                          a.id,
+                          Math.max(0, Math.min(1, x)),
+                          Math.max(0, Math.min(1, y))
+                        );
+                      });
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (dragMovedRef.current) return; // just finished dragging, not a genuine click
                       if (activeTool === 'select') {
                         setSelectedAnnotationId(a.id);
                       } else {
@@ -819,23 +961,21 @@ export default function Canvas() {
               .map((a) => (
                 <div
                   key={a.id}
-                  draggable={openTextId !== a.id}
                   onMouseDown={(e) => {
-                    e.stopPropagation();
                     setSelectedAnnotationId(a.id);
-                  }}
-                  onDragEnd={(e) => {
-                    if (e.clientX === 0 && e.clientY === 0) return; // dropped outside the page
-                    const rect = overlayRef.current!.getBoundingClientRect();
-                    const x = (e.clientX - rect.left) / rect.width;
-                    const y = (e.clientY - rect.top) / rect.height;
-                    updateTextBoxPosition(
-                      doc.id,
-                      currentPage,
-                      a.id,
-                      Math.max(0, Math.min(0.95, x)),
-                      Math.max(0, Math.min(0.95, y))
-                    );
+                    if (openTextId === a.id) {
+                      e.stopPropagation();
+                      return; // actively typing — don't start a drag
+                    }
+                    startSmoothDrag(e, a.x, a.y, (x, y) => {
+                      updateTextBoxPosition(
+                        doc.id,
+                        currentPage,
+                        a.id,
+                        Math.max(0, Math.min(0.95, x)),
+                        Math.max(0, Math.min(0.95, y))
+                      );
+                    });
                   }}
                   className="pointer-events-auto group absolute cursor-move"
                   style={{
@@ -946,22 +1086,17 @@ export default function Canvas() {
                 <img
                   key={a.id}
                   src={a.dataUrl}
-                  draggable
                   onMouseDown={(e) => {
-                    e.stopPropagation();
                     setSelectedAnnotationId(a.id);
-                  }}
-                  onDragEnd={(e) => {
-                    const rect = overlayRef.current!.getBoundingClientRect();
-                    const x = (e.clientX - rect.left) / rect.width - a.w / 2;
-                    const y = (e.clientY - rect.top) / rect.height - a.h / 2;
-                    updateImagePosition(
-                      doc.id,
-                      currentPage,
-                      a.id,
-                      Math.max(0, Math.min(1 - a.w, x)),
-                      Math.max(0, Math.min(1 - a.h, y))
-                    );
+                    startSmoothDrag(e, a.x, a.y, (x, y) => {
+                      updateImagePosition(
+                        doc.id,
+                        currentPage,
+                        a.id,
+                        Math.max(0, Math.min(1 - a.w, x)),
+                        Math.max(0, Math.min(1 - a.h, y))
+                      );
+                    });
                   }}
                   className="pointer-events-auto group absolute cursor-move border border-transparent hover:border-accent"
                   style={{
