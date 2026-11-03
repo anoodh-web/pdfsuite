@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AlignCenter, AlignLeft, AlignRight, FilePlus2, FileWarning, TriangleAlert, X } from 'lucide-react';
+import { AlignCenter, AlignLeft, AlignRight, FilePlus2, FileWarning, TriangleAlert, WrapText, X } from 'lucide-react';
 import { RenderingCancelledException, TextLayer, type RenderTask } from 'pdfjs-dist';
 import {
   useDocumentStore,
   LINE_BASELINE_RATIO,
   sampleBoxBackgroundColor,
-  lineHorizontalLimits,
-  lineExtent,
+  lineOverflows,
   fitFontSize,
+  planLineWrap,
   type Annotation,
   type CachedLine,
   type LineAlign,
 } from '../store/useDocumentStore';
+import type { WrapContext } from '../store/lineLayout';
 import SignaturePad from './SignaturePad';
 import { FONT_FAMILY_CSS } from './FontFamilyDropdown';
 
@@ -134,9 +135,11 @@ export default function Canvas() {
     createFormField,
     deleteFormField,
     pageLines,
+    pageObstacles,
     loadPageLines,
     lineEdits,
     setLineEdit,
+    setLineEdits,
     pendingCrop,
     setPendingCrop,
     undo,
@@ -240,6 +243,38 @@ export default function Canvas() {
     );
     bgSampleCache.current.set(line.index, color);
     return color;
+  };
+
+  // What the wrap planner needs to know about the current page's lines: their
+  // text and style as currently edited, and how wide text measures in them.
+  const lineWrapContext = (docId: string): WrapContext => {
+    const scale = zoom * 1.4; // same scale the page is rendered at
+    const edits = lineEdits[docId]?.[currentPage] ?? {};
+    const overrides = lineStyleOverrides[docId]?.[currentPage] ?? {};
+    const styleOf = (l: CachedLine) => {
+      const o = overrides[l.index];
+      return {
+        family: o?.fontFamily ?? l.fontFamily,
+        bold: o?.bold ?? l.bold,
+        italic: o?.italic ?? l.italic,
+        sizePt: o?.fontSize ?? l.fontSizePt,
+        align: o?.align ?? l.align,
+      };
+    };
+    return {
+      lines: pageLines[docId]?.[currentPage] ?? [],
+      obstacles: pageObstacles[docId]?.[currentPage] ?? [],
+      pageWidthPts: pageSize.w / scale,
+      pageHeightPts: pageSize.h / scale,
+      textOf: (l) => edits[l.index] ?? l.text,
+      styleOf,
+      measure: (l, text) => {
+        const st = styleOf(l);
+        return pageSize.w
+          ? measureTextWidthPx(text, st.sizePt * scale, FONT_FAMILY_CSS[st.family], st.bold, st.italic) / pageSize.w
+          : 0;
+      },
+    };
   };
 
   // Global keyboard shortcuts: Ctrl/Cmd+Z undo, Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z
@@ -464,6 +499,9 @@ export default function Canvas() {
   // live text of the line being edited, so the overflow warning tracks
   // what's being typed rather than only the last committed value
   const [lineDraft, setLineDraft] = useState('');
+  // set when the editor closes itself after wrapping, so the input's blur
+  // doesn't then write the whole unwrapped text back onto the first line
+  const skipLineBlurCommitRef = useRef(false);
 
   useEffect(() => {
     setEditingLineIndex(null);
@@ -1223,7 +1261,7 @@ export default function Canvas() {
                 </div>
               ))}
 
-            {(pageLines[doc.id]?.[currentPage] ?? []).map((line) => {
+            {(pageLines[doc.id]?.[currentPage] ?? []).map((line, _i, linesOnPage) => {
               const textOverride = lineEdits[doc.id]?.[currentPage]?.[line.index];
               const hasTextOverride = textOverride !== undefined && textOverride !== line.text;
               const isEditing = editingLineIndex === line.index;
@@ -1265,26 +1303,34 @@ export default function Canvas() {
               // outside Edit mode: only show something if this line has a
               // saved override (so edits stay visible while browsing normally)
               if (activeTool !== 'edit-text' && !hasOverride && !isEditing) return null;
+              // a line a wrap added only exists while it has text
+              if (line.synthetic && !hasOverride && !isEditing) return null;
 
-              // Would the new text run into neighbouring text (or off the
-              // page)? PDFs can't reflow, so this is flagged rather than
-              // silently overlapping — with a one-click shrink-to-fit.
-              const linesOnPage = pageLines[doc.id]?.[currentPage] ?? [];
+              // Would the new text run into neighbouring text, an image or a
+              // shape (or off the page)? PDFs can't reflow by themselves, so
+              // this is flagged rather than silently overlapping — with
+              // one-click wrap onto the next lines, or shrink-to-fit.
+              const obstaclesOnPage = pageObstacles[doc.id]?.[currentPage] ?? [];
               const shownText = isEditing ? lineDraft : displayText;
               const shownWidth = pageSize.w
                 ? measureTextWidthPx(shownText, fontPx, fontFamilyCss, effBold, effItalic) / pageSize.w
                 : 0;
-              const extent = lineExtent(line, effAlign, shownWidth);
-              const limits = lineHorizontalLimits(linesOnPage, line);
               const overflows =
                 (isEditing || hasOverride) &&
                 shownText.trim() !== '' &&
-                (extent.start < limits.min - 0.001 || extent.end > limits.max + 0.001);
+                lineOverflows(linesOnPage, line, effAlign, shownWidth, obstaclesOnPage);
               const shrinkToFit = () => {
                 const currentSize = effSize ?? line.fontSizePt;
-                const fitted = fitFontSize(linesOnPage, line, effAlign, shownWidth, currentSize);
+                const fitted = fitFontSize(linesOnPage, line, effAlign, shownWidth, currentSize, obstaclesOnPage);
                 setLineEdit(doc.id, currentPage, line.index, shownText);
                 setLineStyleOverride(doc.id, currentPage, line.index, { fontSize: fitted });
+              };
+              const wrapPlan = overflows && isEditing ? planLineWrap(lineWrapContext(doc.id), line, shownText) : null;
+              const wrapOntoNextLines = () => {
+                if (!wrapPlan) return;
+                setLineEdits(doc.id, currentPage, wrapPlan.edits, wrapPlan.newLines);
+                skipLineBlurCommitRef.current = true;
+                setEditingLineIndex(null);
               };
 
               // anchor the box on the edge the line is aligned to, so a
@@ -1352,6 +1398,10 @@ export default function Canvas() {
                         onFocus={(e) => e.target.select()}
                         onChange={(e) => setLineDraft(e.target.value)}
                         onBlur={(e) => {
+                          if (skipLineBlurCommitRef.current) {
+                            skipLineBlurCommitRef.current = false;
+                            return;
+                          }
                           setLineEdit(doc.id, currentPage, line.index, e.target.value);
                           setEditingLineIndex(null);
                         }}
@@ -1422,7 +1472,18 @@ export default function Canvas() {
                           }`}
                         >
                           <TriangleAlert size={11} />
-                          <span>Runs into nearby text</span>
+                          <span>Runs into nearby text or images</span>
+                          {wrapPlan && (
+                            <button
+                              onMouseDown={keepLineEditorFocus}
+                              onClick={wrapOntoNextLines}
+                              className="flex items-center gap-0.5 rounded bg-white/20 px-1 font-medium hover:bg-white/30"
+                              title="Move the words that don't fit onto the lines below, like a word processor would"
+                            >
+                              <WrapText size={11} />
+                              Wrap to next line
+                            </button>
+                          )}
                           <button
                             onMouseDown={keepLineEditorFocus}
                             onClick={shrinkToFit}
@@ -1438,6 +1499,7 @@ export default function Canvas() {
                     <div
                       onClick={() => {
                         if (activeTool !== 'edit-text') return;
+                        skipLineBlurCommitRef.current = false;
                         setLineDraft(displayText);
                         setEditingLineIndex(line.index);
                         setActiveEditLine({ docId: doc.id, page: currentPage, lineIndex: line.index });

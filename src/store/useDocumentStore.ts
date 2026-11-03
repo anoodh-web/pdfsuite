@@ -23,6 +23,24 @@ import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { createWorker } from 'tesseract.js';
 import { removeTextInBands, isInTextBand, type TextBand } from './contentStreamText';
+import {
+  ASCENT_MULT,
+  LINE_BASELINE_RATIO,
+  LINE_HEIGHT_MULT,
+  collectPageObstacles,
+  type PageObstacle,
+} from './lineLayout';
+
+export {
+  LINE_BASELINE_RATIO,
+  fitFontSize,
+  lineExtent,
+  lineHorizontalLimits,
+  lineOverflows,
+  planLineWrap,
+  type PageObstacle,
+  type WrapPlan,
+} from './lineLayout';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -269,6 +287,9 @@ export interface CachedLine {
   // which edge stays put when the text changes length — detected from the
   // neighbouring lines in the same column (see detectLineAlignments)
   align: LineAlign;
+  // a line added below a paragraph when edited text wrapped past its last
+  // line — there was no text here in the original page
+  synthetic?: boolean;
 }
 
 // PDFs don't record alignment, so infer it the way a reader would: a line
@@ -308,68 +329,6 @@ function detectLineAlignments(lines: CachedLine[], pageWidthPts: number): LineAl
     return 'left';
   });
 }
-
-// Normalized (0-1) horizontal room a line can grow into before it would run
-// into another text line on the same row, or off the page.
-export function lineHorizontalLimits(lines: CachedLine[], line: CachedLine): { min: number; max: number } {
-  const GAP = 0.004;
-  let min = 0.01;
-  let max = 0.99;
-  for (const o of lines) {
-    if (o.index === line.index) continue;
-    const overlapsRow = o.yTop < line.yTop + line.h && o.yTop + o.h > line.yTop;
-    if (!overlapsRow) continue;
-    if (o.x >= line.x + line.w) max = Math.min(max, o.x - GAP);
-    else if (o.x + o.w <= line.x) min = Math.max(min, o.x + o.w + GAP);
-  }
-  // the line's own original extent is always fair game, even if the
-  // document already put it closer to the edge than our margin
-  return { min: Math.min(min, line.x), max: Math.max(max, line.x + line.w) };
-}
-
-// Where new text of the given normalized width would sit, anchored the way
-// the line is aligned.
-export function lineExtent(line: CachedLine, align: LineAlign, width: number): { start: number; end: number } {
-  if (align === 'right') return { start: line.x + line.w - width, end: line.x + line.w };
-  if (align === 'center') {
-    const c = line.x + line.w / 2;
-    return { start: c - width / 2, end: c + width / 2 };
-  }
-  return { start: line.x, end: line.x + width };
-}
-
-// Largest point size (in 0.5pt steps, at least half the original) at which
-// text measuring `width` at `sizePt` fits inside the line's limits.
-export function fitFontSize(
-  lines: CachedLine[],
-  line: CachedLine,
-  align: LineAlign,
-  width: number,
-  sizePt: number
-): number {
-  const { min, max } = lineHorizontalLimits(lines, line);
-  const available =
-    align === 'right'
-      ? line.x + line.w - min
-      : align === 'center'
-      ? 2 * Math.min(line.x + line.w / 2 - min, max - (line.x + line.w / 2))
-      : max - line.x;
-  if (width <= available) return sizePt;
-  const fitted = Math.floor(((sizePt * available) / width) * 2) / 2;
-  return Math.max(fitted, Math.ceil(line.fontSizePt / 2));
-}
-
-// Shared geometry for detected text lines — used both when computing each
-// line's display box (loadPageLines) and when baking edited text back into
-// the page (applyRedactions), so the two are provably consistent rather
-// than relying on two independently-guessed numbers landing close enough.
-// LINE_HEIGHT_MULT is the box height as a multiple of font size; ASCENT_MULT
-// is how far the baseline sits below the top of that box. Their ratio is
-// where the baseline falls within the box (~0.808, i.e. near the bottom,
-// as real text baselines are — not centered).
-const LINE_HEIGHT_MULT = 1.3;
-const ASCENT_MULT = 1.05;
-export const LINE_BASELINE_RATIO = ASCENT_MULT / LINE_HEIGHT_MULT;
 
 // Samples the real rendered color around a text box, avoiding its center
 // (where the glyphs we're trying to hide actually are) so the "cover"
@@ -1037,7 +996,11 @@ async function bakeLineEditsAsVector(
   }
 
   const pageWidthPts = page.getCropBox().width;
-  if (!removeTextInBands(pdfDoc, page, bandsForJobs(jobs, pageWidthPts, false))) return false;
+  // lines added by wrapping had no text in the original to remove
+  const replaced = jobs.filter((j) => !j.line.synthetic);
+  if (replaced.length > 0 && !removeTextInBands(pdfDoc, page, bandsForJobs(replaced, pageWidthPts, false))) {
+    return false;
+  }
 
   for (const { job, font, text, width } of prepared) {
     const { baselinePt: y, color } = job.line;
@@ -1272,6 +1235,8 @@ interface DocumentState {
   signOut: () => void;
   formFields: Record<string, DetectedFormField[]>;
   pageLines: Record<string, Record<number, CachedLine[]>>;
+  // images and shapes on each page, so edited text can be kept clear of them
+  pageObstacles: Record<string, Record<number, PageObstacle[]>>;
   lineEdits: Record<string, Record<number, Record<number, string>>>;
   // manual overrides on top of the detected style for a line — lets a
   // user change font family/size/bold/italic/underline on existing PDF
@@ -1407,6 +1372,9 @@ interface DocumentState {
   flattenForm: (docId: string) => Promise<void>;
   loadPageLines: (docId: string, pageNum: number) => Promise<void>;
   setLineEdit: (docId: string, page: number, lineIndex: number, text: string) => void;
+  // several line texts at once as one undo step, e.g. a line wrapping onto
+  // the next ones; newLines are appended to the page's lines first
+  setLineEdits: (docId: string, page: number, edits: Record<number, string>, newLines?: CachedLine[]) => void;
 
   // File tab
   createBlankDocument: () => Promise<void>;
@@ -1496,6 +1464,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   userProfile: loadProfile(),
   formFields: {},
   pageLines: {},
+  pageObstacles: {},
   lineEdits: {},
   lineStyleOverrides: {},
   activeEditLine: null,
@@ -3612,6 +3581,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       for (const p of pagesToFlatten) delete clearedLineEdits[p];
       const clearedLines = { ...(s.pageLines[docId] ?? {}) };
       for (const p of pagesToFlatten) delete clearedLines[p]; // re-derive from the new flattened page if revisited
+      const clearedObstacles = { ...(s.pageObstacles[docId] ?? {}) };
+      for (const p of pagesToFlatten) delete clearedObstacles[p];
       const clearedStyleOverrides = { ...(s.lineStyleOverrides[docId] ?? {}) };
       for (const p of pagesToFlatten) delete clearedStyleOverrides[p];
 
@@ -3628,6 +3599,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
         lineEdits: { ...s.lineEdits, [docId]: clearedLineEdits },
         lineStyleOverrides: { ...s.lineStyleOverrides, [docId]: clearedStyleOverrides },
         pageLines: { ...s.pageLines, [docId]: clearedLines },
+        pageObstacles: { ...s.pageObstacles, [docId]: clearedObstacles },
         ocrProgress: null,
       };
     });
@@ -3796,11 +3768,21 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       detectLineAlignments(cached, pageWidthPts).forEach((align, i) => {
         cached[i].align = align;
       });
+      let obstacles: PageObstacle[] = [];
+      try {
+        obstacles = collectPageObstacles(await page.getOperatorList(), pdfjsLib.OPS, page.view);
+      } catch (e) {
+        console.warn('Could not read images/shapes for overflow checks:', e);
+      }
 
       set((s) => ({
         pageLines: {
           ...s.pageLines,
           [docId]: { ...(s.pageLines[docId] ?? {}), [pageNum]: cached },
+        },
+        pageObstacles: {
+          ...s.pageObstacles,
+          [docId]: { ...(s.pageObstacles[docId] ?? {}), [pageNum]: obstacles },
         },
       }));
 
@@ -3838,6 +3820,23 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const docEdits = { ...(lineEdits[docId] ?? {}) };
     docEdits[page] = { ...(docEdits[page] ?? {}), [lineIndex]: text };
     set({ lineEdits: { ...lineEdits, [docId]: docEdits } });
+  },
+
+  setLineEdits: (docId, page, edits, newLines = []) => {
+    const { annotations, lineEdits, lineStyleOverrides, pageLines, undoStack } = get();
+    set({ undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides }], redoStack: [] });
+    const docEdits = { ...(lineEdits[docId] ?? {}) };
+    docEdits[page] = { ...(docEdits[page] ?? {}), ...edits };
+    const update: Partial<DocumentState> = { lineEdits: { ...lineEdits, [docId]: docEdits } };
+    if (newLines.length > 0) {
+      // undo leaves these in place with no text, which draws nothing
+      const docLines = pageLines[docId] ?? {};
+      update.pageLines = {
+        ...pageLines,
+        [docId]: { ...docLines, [page]: [...(docLines[page] ?? []), ...newLines] },
+      };
+    }
+    set(update);
   },
 
   setLineStyleOverride: (docId, page, lineIndex, patch) => {
