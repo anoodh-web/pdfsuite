@@ -205,8 +205,19 @@ export default function Ribbon() {
     ? Object.values(annotations[doc.id] ?? {}).flat().filter((a) => a.type === 'redact' && !a.applied)
         .length
     : 0;
+  // lines with a text change and/or a style change (bold, size, alignment,
+  // shrink-to-fit) — a style-only change still needs Apply to take effect
   const pendingLineEditCount = doc
-    ? Object.values(lineEdits[doc.id] ?? {}).reduce((sum, page) => sum + Object.keys(page).length, 0)
+    ? (() => {
+        const edits = lineEdits[doc.id] ?? {};
+        const styles = lineStyleOverrides[doc.id] ?? {};
+        const pages = new Set([...Object.keys(edits), ...Object.keys(styles)]);
+        let count = 0;
+        for (const p of pages) {
+          count += new Set([...Object.keys(edits[Number(p)] ?? {}), ...Object.keys(styles[Number(p)] ?? {})]).size;
+        }
+        return count;
+      })()
     : 0;
   const pendingRedactions = pendingRedactionCount + pendingLineEditCount;
   const formFieldCount = doc ? (formFields[doc.id] ?? []).length : 0;

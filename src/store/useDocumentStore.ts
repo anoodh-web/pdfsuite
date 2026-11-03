@@ -22,6 +22,7 @@ import {
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { createWorker } from 'tesseract.js';
+import { removeTextInBands, isInTextBand, type TextBand } from './contentStreamText';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -238,12 +239,15 @@ interface TextLine {
   italic: boolean; // detected the same way (e.g. "Helvetica-Italic")
 }
 
+export type LineAlign = 'left' | 'center' | 'right';
+
 export interface LineStyleOverride {
   fontFamily: TextFontFamily;
   fontSize: number;
   bold: boolean;
   italic: boolean;
   underline: boolean;
+  align: LineAlign;
 }
 
 export interface CachedLine {
@@ -262,6 +266,97 @@ export interface CachedLine {
   fontFamily: TextFontFamily; // best-effort category match, not the exact original typeface
   bold: boolean; // detected original weight
   italic: boolean; // detected original slant
+  // which edge stays put when the text changes length — detected from the
+  // neighbouring lines in the same column (see detectLineAlignments)
+  align: LineAlign;
+}
+
+// PDFs don't record alignment, so infer it the way a reader would: a line
+// is right-aligned if it shares its right edge with a nearby line in the
+// same column (and centered if it shares its center), e.g. the stacked
+// right-aligned title block on a brochure cover. Neighbours of nearly the
+// same width say nothing (all three edges match), so they're skipped.
+// Anything undecided stays left-aligned, which is how the editor has
+// always behaved.
+function detectLineAlignments(lines: CachedLine[], pageWidthPts: number): LineAlign[] {
+  const geo = lines.map((l) => {
+    const left = l.leftPt;
+    const right = l.leftPt + l.w * pageWidthPts;
+    return { left, right, center: (left + right) / 2, width: right - left, y: l.baselinePt, size: l.fontSizePt };
+  });
+  return geo.map((g, i) => {
+    const votes = { left: 0, center: 0, right: 0 };
+    geo.forEach((o, j) => {
+      if (i === j) return;
+      const maxSize = Math.max(g.size, o.size);
+      if (Math.abs(o.y - g.y) > maxSize * 6) return; // not a neighbour
+      if (o.right < g.left || o.left > g.right) return; // different column
+      // glyph side-bearings scale with size, so a 36pt title's edge sits a
+      // few points off the 12pt lines it's aligned with
+      const tol = Math.max(1.5, maxSize * 0.2);
+      if (Math.abs(o.width - g.width) <= tol) return; // uninformative
+      const diffs: [LineAlign, number][] = [
+        ['left', Math.abs(o.left - g.left)],
+        ['center', Math.abs(o.center - g.center)],
+        ['right', Math.abs(o.right - g.right)],
+      ];
+      const [best, diff] = diffs.reduce((a, b) => (b[1] < a[1] ? b : a));
+      if (diff <= tol) votes[best]++;
+    });
+    if (votes.right > votes.left && votes.right >= votes.center) return 'right';
+    if (votes.center > votes.left && votes.center > votes.right) return 'center';
+    return 'left';
+  });
+}
+
+// Normalized (0-1) horizontal room a line can grow into before it would run
+// into another text line on the same row, or off the page.
+export function lineHorizontalLimits(lines: CachedLine[], line: CachedLine): { min: number; max: number } {
+  const GAP = 0.004;
+  let min = 0.01;
+  let max = 0.99;
+  for (const o of lines) {
+    if (o.index === line.index) continue;
+    const overlapsRow = o.yTop < line.yTop + line.h && o.yTop + o.h > line.yTop;
+    if (!overlapsRow) continue;
+    if (o.x >= line.x + line.w) max = Math.min(max, o.x - GAP);
+    else if (o.x + o.w <= line.x) min = Math.max(min, o.x + o.w + GAP);
+  }
+  // the line's own original extent is always fair game, even if the
+  // document already put it closer to the edge than our margin
+  return { min: Math.min(min, line.x), max: Math.max(max, line.x + line.w) };
+}
+
+// Where new text of the given normalized width would sit, anchored the way
+// the line is aligned.
+export function lineExtent(line: CachedLine, align: LineAlign, width: number): { start: number; end: number } {
+  if (align === 'right') return { start: line.x + line.w - width, end: line.x + line.w };
+  if (align === 'center') {
+    const c = line.x + line.w / 2;
+    return { start: c - width / 2, end: c + width / 2 };
+  }
+  return { start: line.x, end: line.x + width };
+}
+
+// Largest point size (in 0.5pt steps, at least half the original) at which
+// text measuring `width` at `sizePt` fits inside the line's limits.
+export function fitFontSize(
+  lines: CachedLine[],
+  line: CachedLine,
+  align: LineAlign,
+  width: number,
+  sizePt: number
+): number {
+  const { min, max } = lineHorizontalLimits(lines, line);
+  const available =
+    align === 'right'
+      ? line.x + line.w - min
+      : align === 'center'
+      ? 2 * Math.min(line.x + line.w / 2 - min, max - (line.x + line.w / 2))
+      : max - line.x;
+  if (width <= available) return sizePt;
+  const fitted = Math.floor(((sizePt * available) / width) * 2) / 2;
+  return Math.max(fitted, Math.ceil(line.fontSizePt / 2));
 }
 
 // Shared geometry for detected text lines — used both when computing each
@@ -391,13 +486,31 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
   type Item = { str: string; transform: number[]; width: number; height: number; fontName?: string };
   const styles = (textContent.styles ?? {}) as Record<string, { fontFamily?: string }>;
 
-  // pdf.js only exposes a coarse CSS category here (sans-serif / serif /
-  // monospace / cursive), not the document's actual embedded font — this
-  // maps that category to the closest of our own embeddable families, so
-  // editing a serif document defaults new/edited text to a serif font
-  // instead of always falling back to Helvetica. It is not, and cannot
-  // be, exact-typeface matching.
+  // Matches the document's real embedded font by its base name (e.g.
+  // "MUFUZY+Poppins-SemiBold") to the same family we bundle, so an edited
+  // line keeps its typeface — this was the "font changes when editing"
+  // complaint: Google Slides/Canva exports use Poppins, Montserrat etc.,
+  // which we ship, but every line was being mapped to Helvetica. Fonts we
+  // don't bundle fall back to pdf.js's coarse CSS category (sans-serif /
+  // serif / monospace) as before.
+  const baseNameByFont = new Map<string, string>();
+  const NAMED_FAMILIES: [RegExp, TextFontFamily][] = [
+    [/poppins/, 'Poppins'],
+    [/montserrat/, 'Montserrat'],
+    [/roboto/, 'Roboto'],
+    [/open-?sans/, 'OpenSans'],
+    [/merriweather/, 'Merriweather'],
+    [/playfair/, 'Display'],
+    [/oswald/, 'Condensed'],
+    [/arial|helvetica|liberationsans/, 'Helvetica'],
+    [/times|liberationserif/, 'TimesRoman'],
+    [/courier/, 'Courier'],
+  ];
   const mapFontCategory = (fontName: string | undefined): TextFontFamily => {
+    const baseName = fontName ? baseNameByFont.get(fontName) ?? '' : '';
+    for (const [re, fam] of NAMED_FAMILIES) {
+      if (re.test(baseName)) return fam;
+    }
     const family = fontName ? styles[fontName]?.fontFamily ?? '' : '';
     if (family.includes('serif') && !family.includes('sans-serif')) return 'TimesRoman';
     if (family.includes('monospace')) return 'Courier';
@@ -417,6 +530,7 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
     try {
       const fontObj = page.commonObjs.get(fontName) as { name?: string } | undefined;
       const baseName = (fontObj?.name ?? '').toLowerCase();
+      baseNameByFont.set(fontName, baseName);
       if (/bold|black|heavy|semibold|extrabold/.test(baseName)) {
         boldFontNames.add(fontName);
       }
@@ -746,6 +860,347 @@ async function fetchFontBytes(url: string): Promise<ArrayBuffer> {
   const bytes = await res.arrayBuffer();
   fontByteCache.set(url, bytes);
   return bytes;
+}
+
+const STANDARD_VARIANTS: Record<string, Record<string, StandardFonts>> = {
+  Helvetica: {
+    '00': StandardFonts.Helvetica,
+    '10': StandardFonts.HelveticaBold,
+    '01': StandardFonts.HelveticaOblique,
+    '11': StandardFonts.HelveticaBoldOblique,
+  },
+  TimesRoman: {
+    '00': StandardFonts.TimesRoman,
+    '10': StandardFonts.TimesRomanBold,
+    '01': StandardFonts.TimesRomanItalic,
+    '11': StandardFonts.TimesRomanBoldItalic,
+  },
+  Courier: {
+    '00': StandardFonts.Courier,
+    '10': StandardFonts.CourierBold,
+    '01': StandardFonts.CourierOblique,
+    '11': StandardFonts.CourierBoldOblique,
+  },
+};
+
+// Embeds one family/weight/style into pdfDoc, at most once per cache. The
+// doc must already have fontkit registered for the non-standard families.
+// Returns null if the font couldn't be embedded.
+async function embedTextFont(
+  pdfDoc: PDFDocument,
+  family: TextFontFamily,
+  bold: boolean,
+  italic: boolean,
+  cache: Map<string, PDFFont>
+): Promise<PDFFont | null> {
+  const combo = `${family}|${bold}|${italic}`;
+  const cached = cache.get(combo);
+  if (cached) return cached;
+  const key = `${bold ? '1' : '0'}${italic ? '1' : '0'}`;
+
+  if (STANDARD_VARIANTS[family]) {
+    try {
+      const f = await pdfDoc.embedFont(STANDARD_VARIANTS[family][key]);
+      cache.set(combo, f);
+      return f;
+    } catch (e) {
+      console.warn(`Could not embed ${family} (bold=${bold}, italic=${italic}):`, e);
+      return null;
+    }
+  }
+
+  const files = CUSTOM_FONT_FILES[family];
+  if (!files) return null;
+  // no combined bold-italic file was sourced for these — bold wins if both are on
+  const fileUrl = bold ? files.bold ?? files.regular : italic ? files.italic ?? files.regular : files.regular;
+  try {
+    const bytes = await fetchFontBytes(fileUrl);
+    // subset:false — these particular font files trip up fontkit's
+    // subsetter (verified independently before shipping this);
+    // embedding the full font avoids that at the cost of a larger file
+    const f = await pdfDoc.embedFont(bytes, { subset: false });
+    cache.set(combo, f);
+    return f;
+  } catch (e) {
+    console.warn(`Could not embed the "${family}" font:`, e);
+    return null;
+  }
+}
+
+// ---------- Baking direct line edits (Edit tool) ----------
+// One changed line, with its effective style (override, else what was
+// detected in the original PDF).
+interface LineEditJob {
+  line: CachedLine;
+  text: string;
+  family: TextFontFamily;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  sizePt: number;
+  align: LineAlign;
+  // set once drawn — where the new text actually starts/ends
+  drawnLeftPt?: number;
+  drawnRightPt?: number;
+}
+
+// Left edge (PDF points) for new text of `width`, anchored per the job's
+// alignment — so a right-aligned title grows leftwards, not off the page.
+function alignedLeftPt(job: LineEditJob, width: number, pageWidthPts: number): number {
+  const lineWidthPts = job.line.w * pageWidthPts;
+  if (job.align === 'right') return job.line.leftPt + lineWidthPts - width;
+  if (job.align === 'center') return job.line.leftPt + (lineWidthPts - width) / 2;
+  return job.line.leftPt;
+}
+
+function collectLineEditJobs(
+  lines: CachedLine[],
+  edits: Record<number, string>,
+  overrides: Record<number, Partial<LineStyleOverride>>
+): LineEditJob[] {
+  const jobs: LineEditJob[] = [];
+  const indices = new Set([...Object.keys(edits).map(Number), ...Object.keys(overrides).map(Number)]);
+  for (const idx of indices) {
+    const line = lines[idx];
+    if (!line) continue;
+    const o = overrides[idx];
+    const text = edits[idx] ?? line.text;
+    if (
+      text === line.text &&
+      !o?.fontFamily &&
+      !o?.fontSize &&
+      o?.bold === undefined &&
+      o?.italic === undefined &&
+      !o?.underline &&
+      o?.align === undefined
+    ) {
+      continue; // nothing actually changed on this line
+    }
+    jobs.push({
+      line,
+      text,
+      family: o?.fontFamily ?? line.fontFamily,
+      bold: o?.bold ?? line.bold,
+      italic: o?.italic ?? line.italic,
+      underline: o?.underline ?? false,
+      // the line's real detected point size — not re-derived from its box
+      // height, which is what made edited lines come out a different size
+      sizePt: o?.fontSize ?? line.fontSizePt,
+      align: o?.align ?? line.align,
+    });
+  }
+  return jobs;
+}
+
+function bandsForJobs(jobs: LineEditJob[], pageWidthPts: number, useDrawnWidth: boolean): TextBand[] {
+  return jobs.map((j) => {
+    const originalLeft = j.line.leftPt;
+    const originalRight = j.line.leftPt + j.line.w * pageWidthPts;
+    if (!useDrawnWidth) {
+      return { left: originalLeft, right: originalRight, baseline: j.line.baselinePt, size: j.line.fontSizePt };
+    }
+    return {
+      left: Math.min(originalLeft, j.drawnLeftPt ?? originalLeft),
+      right: Math.max(originalRight, j.drawnRightPt ?? originalRight),
+      baseline: j.line.baselinePt,
+      size: j.sizePt, // the new text may have been shrunk to fit
+    };
+  });
+}
+
+// Swaps edited lines in place as real vector text: the original glyphs are
+// removed from the page's content stream and the new text drawn at the same
+// baseline, size, color and (matched) typeface. Images, links and every
+// other line on the page are left byte-for-byte as they were. Returns false
+// — with the page untouched — if that can't be done safely.
+async function bakeLineEditsAsVector(
+  pdfDoc: PDFDocument,
+  pageIndex: number,
+  jobs: LineEditJob[],
+  fontCache: Map<string, PDFFont>
+): Promise<boolean> {
+  const page = pdfDoc.getPage(pageIndex);
+  if (page.getRotation().angle % 360 !== 0) return false;
+
+  const prepared: { job: LineEditJob; font: PDFFont; text: string; width: number }[] = [];
+  for (const job of jobs) {
+    const font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache);
+    if (!font) return false;
+    const text = job.text.replace(/\t/g, '    ');
+    let width: number;
+    try {
+      width = font.widthOfTextAtSize(text, job.sizePt); // throws on characters the font can't encode
+    } catch {
+      return false;
+    }
+    prepared.push({ job, font, text, width });
+  }
+
+  const pageWidthPts = page.getCropBox().width;
+  if (!removeTextInBands(pdfDoc, page, bandsForJobs(jobs, pageWidthPts, false))) return false;
+
+  for (const { job, font, text, width } of prepared) {
+    const { baselinePt: y, color } = job.line;
+    const x = alignedLeftPt(job, width, pageWidthPts);
+    job.drawnLeftPt = x;
+    job.drawnRightPt = x + width;
+    if (!text.trim()) continue;
+    const c = hexToRgb01(color || '#000000');
+    page.drawText(text, { x, y, size: job.sizePt, font, color: c });
+    if (job.underline) {
+      page.drawLine({
+        start: { x, y: y - job.sizePt * 0.1 },
+        end: { x: x + width, y: y - job.sizePt * 0.1 },
+        thickness: Math.max(0.5, job.sizePt * 0.05),
+        color: c,
+      });
+    }
+  }
+  return true;
+}
+
+type ProxyPage = Awaited<ReturnType<PDFDocumentProxy['getPage']>>;
+
+async function textItemsOf(page: ProxyPage) {
+  const tc = await page.getTextContent();
+  return (tc.items as { str?: string; transform?: number[] }[])
+    .filter((it) => it.str && it.str.trim() && it.transform)
+    .map((it) => ({
+      str: it.str!,
+      x: it.transform![4],
+      y: it.transform![5],
+      size: Math.hypot(it.transform![0], it.transform![1]),
+    }));
+}
+
+const normalizeForCompare = (s: string) => s.normalize('NFKC').replace(/\s+/g, '');
+
+// Re-reads the baked page's text and confirms the edit did exactly what was
+// asked: each edited line now reads as its new text, and every other piece
+// of text on the page is still there, unchanged and unmoved.
+async function verifyBakedLineEdits(before: ProxyPage, after: ProxyPage, jobs: LineEditJob[]): Promise<boolean> {
+  const pageWidthPts = before.view[2] - before.view[0];
+  const oldBands = bandsForJobs(jobs, pageWidthPts, false);
+  const newBands = bandsForJobs(jobs, pageWidthPts, true);
+  const [beforeItems, afterItems] = await Promise.all([textItemsOf(before), textItemsOf(after)]);
+
+  const key = (it: { str: string; x: number; y: number }) => `${it.str}|${Math.round(it.x)}|${Math.round(it.y)}`;
+  const outsideBefore = beforeItems
+    .filter((it) => !oldBands.some((b) => isInTextBand(b, it.x, it.y, it.size)))
+    .map(key)
+    .sort();
+  const outsideAfter = afterItems
+    .filter((it) => !newBands.some((b) => isInTextBand(b, it.x, it.y, it.size)))
+    .map(key)
+    .sort();
+  if (outsideBefore.join('\n') !== outsideAfter.join('\n')) return false;
+
+  return jobs.every((job, i) => {
+    const inside = afterItems
+      .filter((it) => isInTextBand(newBands[i], it.x, it.y, it.size))
+      .sort((a, b) => a.x - b.x)
+      .map((it) => it.str)
+      .join('');
+    return normalizeForCompare(inside) === normalizeForCompare(job.text);
+  });
+}
+
+// Bakes on a throwaway single-page copy first and verifies the result, so a
+// page is only ever edited in place when the outcome is known to be right.
+async function canBakeLineEditsAsVector(
+  source: PDFDocument,
+  pageIndex: number,
+  before: ProxyPage,
+  jobs: LineEditJob[]
+): Promise<boolean> {
+  try {
+    const probe = await PDFDocument.create();
+    probe.registerFontkit(fontkit);
+    const [copied] = await probe.copyPages(source, [pageIndex]);
+    probe.addPage(copied);
+    if (!(await bakeLineEditsAsVector(probe, 0, jobs, new Map()))) return false;
+    const proxy = await bytesToProxy(await probe.save());
+    try {
+      return await verifyBakedLineEdits(before, await proxy.getPage(1), jobs);
+    } finally {
+      void proxy.loadingTask.destroy();
+    }
+  } catch (e) {
+    console.warn('Vector line edit failed, falling back:', e);
+    return false;
+  }
+}
+
+// Export-time fallback when a page can't take the in-place swap: cover each
+// old line with the background color actually behind it, then draw the new
+// text on top. The original glyphs stay in the file underneath.
+async function coverAndDrawLineEdits(
+  pdfDoc: PDFDocument,
+  pageIndex: number,
+  before: ProxyPage,
+  jobs: LineEditJob[],
+  fontCache: Map<string, PDFFont>
+) {
+  const page = pdfDoc.getPage(pageIndex);
+  const pageWidthPts = before.view[2] - before.view[0];
+
+  const viewport = before.getViewport({ scale: 2 });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d')!;
+  await before.render({ canvasContext: ctx, viewport, canvas }).promise;
+
+  for (const job of jobs) {
+    const { baselinePt: y, color } = job.line;
+    let font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache);
+    const text = job.text.replace(/\t/g, '    ');
+    let width = 0;
+    try {
+      width = font ? font.widthOfTextAtSize(text, job.sizePt) : 0;
+    } catch {
+      font = null;
+    }
+    if (!font) {
+      font = await embedTextFont(pdfDoc, 'Helvetica', job.bold, job.italic, fontCache);
+      try {
+        width = font ? font.widthOfTextAtSize(text, job.sizePt) : 0;
+      } catch {
+        console.warn(`Skipping edited line "${text}": no available font can encode it`);
+        continue;
+      }
+    }
+
+    const x = alignedLeftPt(job, width, pageWidthPts);
+    const pad = 2;
+    const size = job.line.fontSizePt;
+    const x0 = Math.min(job.line.leftPt, x) - pad;
+    const x1 = Math.max(job.line.leftPt + job.line.w * pageWidthPts, x + width) + pad;
+    const y0 = y - size * 0.25 - pad;
+    const y1 = y + size * 1.05 + pad;
+    const [vx0, vy0] = viewport.convertToViewportPoint(x0, y1);
+    const [vx1, vy1] = viewport.convertToViewportPoint(x1, y0);
+    const bg = sampleBoxBackgroundColor(
+      ctx,
+      Math.min(vx0, vx1),
+      Math.min(vy0, vy1),
+      Math.abs(vx1 - vx0),
+      Math.abs(vy1 - vy0)
+    );
+    page.drawRectangle({ x: x0, y: y0, width: x1 - x0, height: y1 - y0, color: hexToRgb01(bg) });
+
+    if (!text.trim() || !font) continue;
+    const c = hexToRgb01(color || '#000000');
+    page.drawText(text, { x, y, size: job.sizePt, font, color: c });
+    if (job.underline) {
+      page.drawLine({
+        start: { x, y: y - job.sizePt * 0.1 },
+        end: { x: x + width, y: y - job.sizePt * 0.1 },
+        thickness: Math.max(0.5, job.sizePt * 0.05),
+        color: c,
+      });
+    }
+  }
 }
 
 // ---------- Documents ----------
@@ -2327,67 +2782,42 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     exportDoc.registerFontkit(fontkit); // needed to embed the custom (non-standard) font families
     const font = await exportDoc.embedFont(StandardFonts.Helvetica);
 
-    // Every family+bold+italic combination actually used, gathered up front
+    // Every family+bold+italic combination actually used, embedded up front
     // so each font file/StandardFont variant is only embedded once.
-    const usedCombos = new Set<string>();
+    const fontCache = new Map<string, PDFFont>();
     for (const pageAnns of Object.values(get().annotations[docId] ?? {})) {
       for (const a of pageAnns) {
         if (a.type === 'text') {
-          usedCombos.add(`${a.fontFamily ?? 'Helvetica'}|${!!a.bold}|${!!a.italic}`);
+          await embedTextFont(exportDoc, a.fontFamily ?? 'Helvetica', !!a.bold, !!a.italic, fontCache);
         }
       }
     }
 
-    const fontCache = new Map<string, PDFFont>();
-    const STANDARD_VARIANTS: Record<string, Record<string, StandardFonts>> = {
-      Helvetica: {
-        '00': StandardFonts.Helvetica,
-        '10': StandardFonts.HelveticaBold,
-        '01': StandardFonts.HelveticaOblique,
-        '11': StandardFonts.HelveticaBoldOblique,
-      },
-      TimesRoman: {
-        '00': StandardFonts.TimesRoman,
-        '10': StandardFonts.TimesRomanBold,
-        '01': StandardFonts.TimesRomanItalic,
-        '11': StandardFonts.TimesRomanBoldItalic,
-      },
-      Courier: {
-        '00': StandardFonts.Courier,
-        '10': StandardFonts.CourierBold,
-        '01': StandardFonts.CourierOblique,
-        '11': StandardFonts.CourierBoldOblique,
-      },
-    };
-
-    for (const combo of usedCombos) {
-      const [family, boldStr, italicStr] = combo.split('|');
-      const bold = boldStr === 'true';
-      const italic = italicStr === 'true';
-      const key = `${bold ? '1' : '0'}${italic ? '1' : '0'}`;
-
-      if (STANDARD_VARIANTS[family]) {
-        try {
-          fontCache.set(combo, await exportDoc.embedFont(STANDARD_VARIANTS[family][key]));
-        } catch (e) {
-          console.warn(`Could not embed ${family} (bold=${bold}, italic=${italic}):`, e);
-        }
+    // Bake in direct line edits (Edit tool) that haven't been Applied yet —
+    // first, so annotations drawn below still land on top of them. Same
+    // in-place vector swap as Apply; if a page can't be done that way, the
+    // old line is covered with its own sampled background color and the
+    // new text drawn over it.
+    const docLines = get().pageLines[docId] ?? {};
+    const docLineEdits = get().lineEdits[docId] ?? {};
+    const docStyleOverrides = get().lineStyleOverrides[docId] ?? {};
+    const lineEditPages = new Set([...Object.keys(docLineEdits), ...Object.keys(docStyleOverrides)].map(Number));
+    for (const pageNum of lineEditPages) {
+      if (pageNum < 1 || pageNum > exportDoc.getPageCount()) continue;
+      const jobs = collectLineEditJobs(
+        docLines[pageNum] ?? [],
+        docLineEdits[pageNum] ?? {},
+        docStyleOverrides[pageNum] ?? {}
+      );
+      if (jobs.length === 0) continue;
+      const before = await doc.proxy.getPage(pageNum);
+      if (
+        (await canBakeLineEditsAsVector(exportDoc, pageNum - 1, before, jobs)) &&
+        (await bakeLineEditsAsVector(exportDoc, pageNum - 1, jobs, fontCache))
+      ) {
         continue;
       }
-
-      const files = CUSTOM_FONT_FILES[family];
-      if (!files) continue;
-      // no combined bold-italic file was sourced for these — bold wins if both are on
-      const fileUrl = bold ? files.bold ?? files.regular : italic ? files.italic ?? files.regular : files.regular;
-      try {
-        const bytes = await fetchFontBytes(fileUrl);
-        // subset:false — these particular font files trip up fontkit's
-        // subsetter (verified independently before shipping this);
-        // embedding the full font avoids that at the cost of a larger file
-        fontCache.set(combo, await exportDoc.embedFont(bytes, { subset: false }));
-      } catch (e) {
-        console.warn(`Could not embed the "${family}" font, falling back to Helvetica:`, e);
-      }
+      await coverAndDrawLineEdits(exportDoc, pageNum - 1, before, jobs, fontCache);
     }
 
     const resolveTextFont = (a: TextBoxAnnotation): PDFFont => {
@@ -2517,51 +2947,6 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           font,
           opacity: 0, // invisible layer, but present in the content stream
         });
-      }
-    }
-
-    // Bake in direct line edits (Home -> Edit): mask the original line with
-    // an opaque white rectangle, then draw the edited text in its place
-    // using a standard font at the original position/size. This is a
-    // per-line replacement, not true paragraph reflow — see the Edit tool's
-    // in-app description for what that means in practice.
-    const docLines = get().pageLines[docId] ?? {};
-    const docLineEdits = get().lineEdits[docId] ?? {};
-    for (const pageNumStr of Object.keys(docLineEdits)) {
-      const pageNum = Number(pageNumStr);
-      if (pageNum < 1 || pageNum > exportDoc.getPageCount()) continue;
-      const linesForPage = docLines[pageNum];
-      if (!linesForPage) continue;
-      const editPage = exportDoc.getPage(pageNum - 1);
-      const { width: pw, height: ph } = editPage.getSize();
-      const edits = docLineEdits[pageNum];
-
-      for (const idxStr of Object.keys(edits)) {
-        const idx = Number(idxStr);
-        const line = linesForPage[idx];
-        if (!line) continue;
-        const newText = edits[idx];
-        if (newText === line.text) continue; // unchanged, nothing to bake
-
-        const padPt = 2;
-        const widthPt = line.w * pw;
-        const heightPt = line.h * ph;
-        editPage.drawRectangle({
-          x: line.leftPt - padPt,
-          y: ph - line.yTop * ph - heightPt - padPt,
-          width: widthPt + padPt * 2,
-          height: heightPt + padPt * 2,
-          color: rgb(1, 1, 1),
-        });
-        if (newText.trim()) {
-          editPage.drawText(newText, {
-            x: line.leftPt,
-            y: ph - line.baselinePt - line.fontSizePt * 0.02,
-            size: line.fontSizePt,
-            font,
-            color: rgb(0, 0, 0),
-          });
-        }
       }
     }
 
@@ -2995,23 +3380,58 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     set({ ocrProgress: { active: true, label: 'Applying changes', pct: 0 } });
 
     const newDoc = await PDFDocument.create();
+    newDoc.registerFontkit(fontkit);
     const totalPages = doc.pdfLibDoc.getPageCount();
+    const vectorFontCache = new Map<string, PDFFont>();
+
+    const redactionsOn = (pageNum: number) =>
+      (docAnns[pageNum] ?? []).filter((a): a is RedactionAnnotation => a.type === 'redact' && !a.applied);
+
+    // Decide up front which pages are carried over as-is or with their
+    // edited lines swapped in place as real vector text (verified on a
+    // scratch copy first), so they can all be copied in ONE copyPages call.
+    // Copying page by page made pdf-lib duplicate every shared resource — a
+    // logo or icon used on all 14 pages was written 14 times, inflating the
+    // file by ~60% on every Apply. Pages with redaction marks always
+    // rasterize: that's what guarantees the content under a black box is
+    // really gone.
+    const vectorJobs = new Map<number, LineEditJob[]>(); // page index -> edited lines
+    const keepIndices: number[] = [];
+    for (let i = 0; i < totalPages; i++) {
+      const pageNum = i + 1;
+      const editsHere = lineEditsAfterErase[pageNum] ?? {};
+      const styleOverridesHere = styleOverridesAfterErase[pageNum] ?? {};
+      const hasEdits = Object.keys(editsHere).length > 0 || Object.keys(styleOverridesHere).length > 0;
+      if (redactionsOn(pageNum).length > 0) continue;
+      if (!hasEdits) {
+        keepIndices.push(i);
+        continue;
+      }
+      const jobs = collectLineEditJobs(docLines[pageNum] ?? [], editsHere, styleOverridesHere);
+      if (await canBakeLineEditsAsVector(doc.pdfLibDoc, i, await doc.proxy.getPage(pageNum), jobs)) {
+        vectorJobs.set(i, jobs);
+        keepIndices.push(i);
+      }
+    }
+    const copiedPages = await newDoc.copyPages(doc.pdfLibDoc, keepIndices);
+    const copiedByIndex = new Map(keepIndices.map((pageIndex, k) => [pageIndex, copiedPages[k]]));
 
     for (let i = 0; i < totalPages; i++) {
       const pageNum = i + 1;
-      const redactionsHere = (docAnns[pageNum] ?? []).filter(
-        (a): a is RedactionAnnotation => a.type === 'redact' && !a.applied
-      );
+      const redactionsHere = redactionsOn(pageNum);
       const editsHere = lineEditsAfterErase[pageNum] ?? {};
       const styleOverridesHere = styleOverridesAfterErase[pageNum] ?? {};
       const linesHere = docLines[pageNum] ?? [];
-      const hasEdits = Object.keys(editsHere).length > 0 || Object.keys(styleOverridesHere).length > 0;
 
-      if (redactionsHere.length === 0 && !hasEdits) {
-        // untouched page: copy as-is, no quality/text loss
-        const [copied] = await newDoc.copyPages(doc.pdfLibDoc, [i]);
-        newDoc.addPage(copied);
+      const kept = copiedByIndex.get(i);
+      const jobs = vectorJobs.get(i);
+      if (kept) newDoc.addPage(kept);
+      if (kept && (!jobs || (await bakeLineEditsAsVector(newDoc, newDoc.getPageCount() - 1, jobs, vectorFontCache)))) {
+        // untouched page copied as-is, or edited lines swapped in place as
+        // real text — either way the page keeps its images, links and
+        // selectable text
       } else {
+        if (kept) newDoc.removePage(newDoc.getPageCount() - 1); // already verified on a scratch copy, so not expected
         // rasterize this page with redactions and/or edited-line
         // replacement text burned directly into the pixels — this is what
         // makes text edits genuinely permanent rather than just visually
@@ -3067,12 +3487,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
             !override?.fontSize &&
             override?.bold === undefined &&
             override?.italic === undefined &&
-            !override?.underline
+            !override?.underline &&
+            override?.align === undefined
           ) {
             continue;
           }
 
-          const px = line.x * viewport.width;
+          const effectiveAlign = override?.align ?? line.align;
+          const lineLeftPx = line.x * viewport.width;
+          const lineRightPx = (line.x + line.w) * viewport.width;
           const py = line.yTop * viewport.height;
           const ph = line.h * viewport.height;
 
@@ -3087,7 +3510,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           // overflow portion rendered directly onto un-recolored original
           // pixels the cover never touched — visible as content "going
           // out" past a correctly-colored patch that was simply too narrow.
-          const fontPx = override?.fontSize ? effectiveFontSizePt * scale : (ph / 1.3) * 0.92;
+          // the line's real point size, not an estimate from its box height
+          // (which came out ~8% small and made edited lines visibly shrink)
+          const fontPx = effectiveFontSizePt * scale;
           const canvasFontStack =
             effectiveFamily === 'TimesRoman'
               ? '"Times New Roman", Times, serif'
@@ -3108,7 +3533,16 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           const stylePrefix = effectiveItalic ? 'italic ' : '';
           ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
           const measuredTextWidth = newText.trim() ? ctx.measureText(newText).width : 0;
-          const pw = Math.max(line.w * viewport.width, measuredTextWidth, 4);
+          // anchor the new text the way the line is aligned, and cover both
+          // the original line and wherever the new text now reaches
+          const textX =
+            effectiveAlign === 'right'
+              ? lineRightPx - measuredTextWidth
+              : effectiveAlign === 'center'
+              ? (lineLeftPx + lineRightPx - measuredTextWidth) / 2
+              : lineLeftPx;
+          const px = Math.min(lineLeftPx, textX);
+          const pw = Math.max(Math.max(lineRightPx, textX + measuredTextWidth) - px, 4);
 
           // Sample the real background right here, before covering it —
           // the canvas still holds the untouched original render at this
@@ -3132,15 +3566,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
             ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
             ctx.textBaseline = 'alphabetic';
             const textY = py + ph * LINE_BASELINE_RATIO;
-            ctx.fillText(newText, px, textY);
+            ctx.fillText(newText, textX, textY);
             if (effectiveUnderline) {
               const textWidth = ctx.measureText(newText).width;
               ctx.strokeStyle = line.color || '#000000';
               ctx.lineWidth = Math.max(1, fontPx * 0.05);
               ctx.beginPath();
               const underlineY = textY + fontPx * 0.08;
-              ctx.moveTo(px, underlineY);
-              ctx.lineTo(px + textWidth, underlineY);
+              ctx.moveTo(textX, underlineY);
+              ctx.lineTo(textX + textWidth, underlineY);
               ctx.stroke();
             }
           }
@@ -3178,13 +3612,22 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       for (const p of pagesToFlatten) delete clearedLineEdits[p];
       const clearedLines = { ...(s.pageLines[docId] ?? {}) };
       for (const p of pagesToFlatten) delete clearedLines[p]; // re-derive from the new flattened page if revisited
+      const clearedStyleOverrides = { ...(s.lineStyleOverrides[docId] ?? {}) };
+      for (const p of pagesToFlatten) delete clearedStyleOverrides[p];
 
+      // The edits are now part of the page itself, so their overlays and
+      // cached line geometry have to go too — these were computed but never
+      // returned, which left stale overlays drawn over the new page (at the
+      // old line positions) and let a second Apply bake the same edits again.
       return {
         documents: s.documents.map((d) =>
           d.id === docId ? { ...d, pdfLibDoc: newDoc, proxy, pageCount: proxy.numPages } : d
         ),
         annotations: { ...s.annotations, [docId]: clearedAnns },
         ocrText: { ...s.ocrText, [docId]: clearedOcr },
+        lineEdits: { ...s.lineEdits, [docId]: clearedLineEdits },
+        lineStyleOverrides: { ...s.lineStyleOverrides, [docId]: clearedStyleOverrides },
+        pageLines: { ...s.pageLines, [docId]: clearedLines },
         ocrProgress: null,
       };
     });
@@ -3347,7 +3790,11 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           fontFamily: l.fontFamily,
           bold: l.bold,
           italic: l.italic,
+          align: 'left' as LineAlign,
         };
+      });
+      detectLineAlignments(cached, pageWidthPts).forEach((align, i) => {
+        cached[i].align = align;
       });
 
       set((s) => ({

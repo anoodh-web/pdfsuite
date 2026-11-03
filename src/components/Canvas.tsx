@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { FilePlus2, FileWarning, X } from 'lucide-react';
-import { TextLayer } from 'pdfjs-dist';
+import { AlignCenter, AlignLeft, AlignRight, FilePlus2, FileWarning, TriangleAlert, X } from 'lucide-react';
+import { RenderingCancelledException, TextLayer, type RenderTask } from 'pdfjs-dist';
 import {
   useDocumentStore,
   LINE_BASELINE_RATIO,
   sampleBoxBackgroundColor,
+  lineHorizontalLimits,
+  lineExtent,
+  fitFontSize,
   type Annotation,
   type CachedLine,
+  type LineAlign,
 } from '../store/useDocumentStore';
 import SignaturePad from './SignaturePad';
 import { FONT_FAMILY_CSS } from './FontFamilyDropdown';
@@ -20,17 +24,33 @@ function uid() {
 // instead of staying clamped to the original line's detected width (which
 // was clipping/hiding any text appended past that original length).
 const measureCanvas = document.createElement('canvas');
-function measureTextWidthPx(text: string, fontPx: number, fontFamily: string): number {
+function measureTextWidthPx(text: string, fontPx: number, fontFamily: string, bold = false, italic = false): number {
   const ctx = measureCanvas.getContext('2d');
   if (!ctx) return 0;
-  ctx.font = `${fontPx}px ${fontFamily}`;
+  ctx.font = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontPx}px ${fontFamily}`;
   return ctx.measureText(text || ' ').width;
+}
+
+const ALIGN_OPTIONS: { value: LineAlign; icon: typeof AlignLeft; label: string }[] = [
+  { value: 'left', icon: AlignLeft, label: 'Keep left edge' },
+  { value: 'center', icon: AlignCenter, label: 'Keep centered' },
+  { value: 'right', icon: AlignRight, label: 'Keep right edge' },
+];
+
+// For the buttons beside a line being edited: preventDefault stops the press
+// from moving focus off the text input. Without it the input blurred first,
+// which commits and closes the editor — unmounting the button before its
+// click ever fired, so B/I/U and Shrink to fit silently did nothing.
+function keepLineEditorFocus(e: React.MouseEvent) {
+  e.preventDefault();
+  e.stopPropagation();
 }
 
 export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
+  const renderTaskRef = useRef<RenderTask | null>(null);
 
   // Custom smooth drag — replaces HTML5's native draggable/onDragEnd,
   // which only updates position once, on drop: the browser shows its own
@@ -145,15 +165,34 @@ export default function Canvas() {
     (async () => {
       if (!doc || !canvasRef.current) return;
       try {
+        // pdf.js refuses to start a second render on a canvas that's still
+        // drawing — which is what happened whenever the page re-rendered
+        // mid-draw (Apply swapping in the new document, flipping pages
+        // quickly, zooming), showing "Could not render this page". Wait
+        // for the previous draw to actually stop first.
+        const previous = renderTaskRef.current;
+        if (previous) {
+          previous.cancel();
+          await previous.promise.catch(() => {});
+        }
+        if (cancelled) return;
+
         const page = await doc.proxy.getPage(currentPage);
         const viewport = page.getViewport({ scale: zoom * 1.4 });
         const canvas = canvasRef.current;
-        const ctx = canvas.getContext('2d');
-        if (!ctx || cancelled) return;
+        const ctx = canvas?.getContext('2d');
+        if (!canvas || !ctx || cancelled) return;
         canvas.width = viewport.width;
         canvas.height = viewport.height;
         setPageSize({ w: viewport.width, h: viewport.height });
-        await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+        const task = page.render({ canvasContext: ctx, viewport, canvas });
+        renderTaskRef.current = task;
+        try {
+          await task.promise;
+        } finally {
+          if (renderTaskRef.current === task) renderTaskRef.current = null;
+        }
+        if (cancelled) return;
 
         // build a real, selectable text layer on top of the canvas
         if (textLayerRef.current) {
@@ -167,12 +206,14 @@ export default function Canvas() {
           await layer.render();
         }
       } catch (e) {
-        if (!cancelled) setError('Could not render this page.');
+        if (cancelled || e instanceof RenderingCancelledException) return; // superseded by a newer render
+        setError('Could not render this page.');
         console.error(e);
       }
     })();
     return () => {
       cancelled = true;
+      renderTaskRef.current?.cancel();
     };
   }, [doc, currentPage, zoom]);
 
@@ -420,6 +461,9 @@ export default function Canvas() {
   }, [doc, currentPage, loadPageLines]);
 
   const [editingLineIndex, setEditingLineIndex] = useState<number | null>(null);
+  // live text of the line being edited, so the overflow warning tracks
+  // what's being typed rather than only the last committed value
+  const [lineDraft, setLineDraft] = useState('');
 
   useEffect(() => {
     setEditingLineIndex(null);
@@ -1191,7 +1235,8 @@ export default function Canvas() {
                   styleOverride.fontSize !== undefined ||
                   styleOverride.bold !== undefined ||
                   styleOverride.italic !== undefined ||
-                  !!styleOverride.underline);
+                  !!styleOverride.underline ||
+                  styleOverride.align !== undefined);
               // A line needs to keep rendering its live overlay if
               // *either* its text or its formatting has been changed —
               // this was the actual bug behind "formatting doesn't show
@@ -1215,10 +1260,41 @@ export default function Canvas() {
                 ? effSize * zoom * 1.4
                 : Math.max(8, (line.h * pageSize.h) / 1.3);
               const fontFamilyCss = FONT_FAMILY_CSS[effFamily];
+              const effAlign = styleOverride?.align ?? line.align;
 
               // outside Edit mode: only show something if this line has a
               // saved override (so edits stay visible while browsing normally)
               if (activeTool !== 'edit-text' && !hasOverride && !isEditing) return null;
+
+              // Would the new text run into neighbouring text (or off the
+              // page)? PDFs can't reflow, so this is flagged rather than
+              // silently overlapping — with a one-click shrink-to-fit.
+              const linesOnPage = pageLines[doc.id]?.[currentPage] ?? [];
+              const shownText = isEditing ? lineDraft : displayText;
+              const shownWidth = pageSize.w
+                ? measureTextWidthPx(shownText, fontPx, fontFamilyCss, effBold, effItalic) / pageSize.w
+                : 0;
+              const extent = lineExtent(line, effAlign, shownWidth);
+              const limits = lineHorizontalLimits(linesOnPage, line);
+              const overflows =
+                (isEditing || hasOverride) &&
+                shownText.trim() !== '' &&
+                (extent.start < limits.min - 0.001 || extent.end > limits.max + 0.001);
+              const shrinkToFit = () => {
+                const currentSize = effSize ?? line.fontSizePt;
+                const fitted = fitFontSize(linesOnPage, line, effAlign, shownWidth, currentSize);
+                setLineEdit(doc.id, currentPage, line.index, shownText);
+                setLineStyleOverride(doc.id, currentPage, line.index, { fontSize: fitted });
+              };
+
+              // anchor the box on the edge the line is aligned to, so a
+              // right-aligned title grows leftwards in the preview too
+              const anchorStyle: React.CSSProperties =
+                effAlign === 'right'
+                  ? { right: `${(1 - line.x - line.w) * 100}%`, maxWidth: `${(line.x + line.w) * 100}%` }
+                  : effAlign === 'center'
+                  ? { left: `${(line.x + line.w / 2) * 100}%`, transform: 'translateX(-50%)' }
+                  : { left: `${line.x * 100}%`, maxWidth: `calc(100% - ${line.x * 100}%)` };
 
               return (
                 <div
@@ -1226,11 +1302,10 @@ export default function Canvas() {
                   onMouseDown={(e) => e.stopPropagation()}
                   className="pointer-events-auto absolute"
                   style={{
-                    left: `${line.x * 100}%`,
+                    ...anchorStyle,
                     top: `${line.yTop * 100}%`,
                     minWidth: `${Math.max(line.w, 0.02) * 100}%`,
                     width: 'max-content',
-                    maxWidth: `calc(100% - ${line.x * 100}%)`,
                     height: `${line.h * 100}%`,
                   }}
                 >
@@ -1241,7 +1316,7 @@ export default function Canvas() {
                     />
                   )}
                   {isEditing ? (
-                    <div className="flex items-start gap-1">
+                    <div className={`flex items-start gap-1 ${effAlign === 'right' ? 'flex-row-reverse' : ''}`}>
                       <input
                         autoFocus
                         defaultValue={displayText}
@@ -1265,22 +1340,17 @@ export default function Canvas() {
                           // clearly marks this as the active edit box
                           // regardless of what the fill color is.
                           backgroundColor: getSampledBackground(line),
+                          textAlign: effAlign,
+                          // grows live as you type, instead of only
+                          // resizing after the edit is committed
                           width: `${Math.max(
-                            measureTextWidthPx(displayText, fontPx, fontFamilyCss) + 16,
-                            line.w * pageSize.w * zoom
+                            measureTextWidthPx(lineDraft, fontPx, fontFamilyCss, effBold, effItalic) + 16,
+                            line.w * pageSize.w
                           )}px`,
                         }}
-                        className="border border-accent px-0.5 focus:outline-none"
+                        className={`border px-0.5 focus:outline-none ${overflows ? 'border-signal-danger' : 'border-accent'}`}
                         onFocus={(e) => e.target.select()}
-                        onChange={(e) => {
-                          // grow the box live as you type, instead of only
-                          // resizing after the edit is committed
-                          const w = Math.max(
-                            measureTextWidthPx(e.target.value, fontPx, fontFamilyCss) + 16,
-                            line.w * pageSize.w * zoom
-                          );
-                          e.target.style.width = `${w}px`;
-                        }}
+                        onChange={(e) => setLineDraft(e.target.value)}
                         onBlur={(e) => {
                           setLineEdit(doc.id, currentPage, line.index, e.target.value);
                           setEditingLineIndex(null);
@@ -1295,7 +1365,7 @@ export default function Canvas() {
                       />
                       <div className="flex gap-0.5 rounded bg-ink-700 p-0.5">
                         <button
-                          onMouseDown={(e) => e.stopPropagation()}
+                          onMouseDown={keepLineEditorFocus}
                           onClick={() =>
                             setLineStyleOverride(doc.id, currentPage, line.index, { bold: !effBold })
                           }
@@ -1305,7 +1375,7 @@ export default function Canvas() {
                           B
                         </button>
                         <button
-                          onMouseDown={(e) => e.stopPropagation()}
+                          onMouseDown={keepLineEditorFocus}
                           onClick={() =>
                             setLineStyleOverride(doc.id, currentPage, line.index, { italic: !effItalic })
                           }
@@ -1315,7 +1385,7 @@ export default function Canvas() {
                           I
                         </button>
                         <button
-                          onMouseDown={(e) => e.stopPropagation()}
+                          onMouseDown={keepLineEditorFocus}
                           onClick={() =>
                             setLineStyleOverride(doc.id, currentPage, line.index, {
                               underline: !effUnderline,
@@ -1326,16 +1396,56 @@ export default function Canvas() {
                         >
                           U
                         </button>
+                        <span className="mx-0.5 w-px self-stretch bg-ink-500" />
+                        {ALIGN_OPTIONS.map(({ value, icon: Icon, label }) => (
+                          <button
+                            key={value}
+                            onMouseDown={keepLineEditorFocus}
+                            onClick={() => {
+                              setLineEdit(doc.id, currentPage, line.index, shownText);
+                              setLineStyleOverride(doc.id, currentPage, line.index, { align: value });
+                            }}
+                            className={`rounded px-0.5 ${effAlign === value ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
+                            title={label}
+                          >
+                            <Icon size={11} />
+                          </button>
+                        ))}
                       </div>
+                      {overflows && (
+                        // under the line rather than beside the toolbar: off
+                        // to the side it ended up past the page edge and
+                        // clipped, exactly when the text is too long
+                        <div
+                          className={`absolute top-full z-10 mt-0.5 flex items-center gap-1 whitespace-nowrap rounded bg-signal-danger/90 px-1.5 py-0.5 text-[10px] text-white shadow ${
+                            effAlign === 'right' ? 'right-0' : 'left-0'
+                          }`}
+                        >
+                          <TriangleAlert size={11} />
+                          <span>Runs into nearby text</span>
+                          <button
+                            onMouseDown={keepLineEditorFocus}
+                            onClick={shrinkToFit}
+                            className="rounded bg-white/20 px-1 font-medium hover:bg-white/30"
+                            title="Reduce the font size just enough for the text to fit"
+                          >
+                            Shrink to fit
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div
                       onClick={() => {
                         if (activeTool !== 'edit-text') return;
+                        setLineDraft(displayText);
                         setEditingLineIndex(line.index);
                         setActiveEditLine({ docId: doc.id, page: currentPage, lineIndex: line.index });
                       }}
+                      title={overflows ? 'This text runs into nearby text — click to edit or shrink it' : undefined}
                       className={`absolute inset-0 flex items-end whitespace-nowrap px-0.5 ${
+                        effAlign === 'right' ? 'justify-end' : effAlign === 'center' ? 'justify-center' : ''
+                      } ${overflows ? 'outline outline-1 outline-dashed outline-signal-danger' : ''} ${
                         activeTool === 'edit-text'
                           ? 'cursor-text hover:outline hover:outline-1 hover:outline-dashed hover:outline-accent'
                           : ''
