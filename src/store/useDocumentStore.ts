@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import * as pdfjsLib from 'pdfjs-dist';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { PDFDocument, degrees, rgb, StandardFonts, EncryptedPDFError, PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, type PDFFont } from '@cantoo/pdf-lib';
-import fontkit from '@pdf-lib/fontkit';
+import * as fontkit from 'fontkit';
 import { PDFDocument as SigningPDFDocument } from 'pdf-lib';
 import { pdflibAddPlaceholder } from '@signpdf/placeholder-pdf-lib';
 import signpdf from '@signpdf/signpdf';
@@ -23,6 +23,9 @@ import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { createWorker } from 'tesseract.js';
 import { removeTextInBands, isInTextBand, type TextBand } from './contentStreamText';
+import { FONT_FAMILY_CSS } from '../components/FontFamilyDropdown';
+import { compressPdfInPlace, type CompressStats } from './compressPdf';
+import { stripUnusedGlyphs } from './fontStrip';
 import {
   ASCENT_MULT,
   LINE_BASELINE_RATIO,
@@ -90,7 +93,13 @@ export type TextFontFamily =
   | 'Montserrat'
   | 'Roboto'
   | 'OpenSans'
-  | 'Merriweather';
+  | 'Merriweather'
+  | 'Lato'
+  | 'Barlow'
+  | 'FiraSans'
+  | 'Ubuntu'
+  | 'PTSans'
+  | 'PTSerif';
 
 export interface TextBoxAnnotation extends BaseAnnotation {
   type: 'text';
@@ -255,6 +264,7 @@ interface TextLine {
   fontFamily: TextFontFamily; // best-effort category, mapped to our closest embeddable equivalent
   bold: boolean; // detected via the font's real base name (e.g. "Helvetica-Bold")
   italic: boolean; // detected the same way (e.g. "Helvetica-Italic")
+  weight: number; // 400 regular, 500 medium, 600 semibold, 700 bold
 }
 
 export type LineAlign = 'left' | 'center' | 'right';
@@ -282,8 +292,9 @@ export interface CachedLine {
   fontSizePt: number;
   color: string; // best-effort detected original fill color, hex
   fontFamily: TextFontFamily; // best-effort category match, not the exact original typeface
-  bold: boolean; // detected original weight
+  bold: boolean; // detected original weight is semibold or heavier
   italic: boolean; // detected original slant
+  weight: number; // detected original weight: 400, 500, 600 or 700
   // which edge stays put when the text changes length — detected from the
   // neighbouring lines in the same column (see detectLineAlignments)
   align: LineAlign;
@@ -459,6 +470,12 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
     [/roboto/, 'Roboto'],
     [/open-?sans/, 'OpenSans'],
     [/merriweather/, 'Merriweather'],
+    [/lato/, 'Lato'],
+    [/barlow/, 'Barlow'],
+    [/fira-?sans/, 'FiraSans'],
+    [/ubuntu/, 'Ubuntu'],
+    [/pt-?serif|ptserif/, 'PTSerif'],
+    [/pt-?sans|ptsans/, 'PTSans'],
     [/playfair/, 'Display'],
     [/oswald/, 'Condensed'],
     [/arial|helvetica|liberationsans/, 'Helvetica'],
@@ -485,6 +502,8 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
   // directly against a real generated PDF before relying on it.
   const boldFontNames = new Set<string>();
   const italicFontNames = new Set<string>();
+  // the exact weight, so a SemiBold heading isn't re-set in Bold
+  const weightByFont = new Map<string, number>();
   for (const fontName of Object.keys(styles)) {
     try {
       const fontObj = page.commonObjs.get(fontName) as { name?: string } | undefined;
@@ -496,6 +515,18 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
       if (/italic|oblique/.test(baseName)) {
         italicFontNames.add(fontName);
       }
+      weightByFont.set(
+        fontName,
+        /black|heavy|extrabold|ultrabold/.test(baseName)
+          ? 700
+          : /semibold|demibold|semi-bold|demi-bold/.test(baseName)
+          ? 600
+          : /bold/.test(baseName)
+          ? 700
+          : /medium/.test(baseName)
+          ? 500
+          : 400
+      );
     } catch {
       // font object not resolvable synchronously — leave undetected (falls back to not-bold/not-italic)
     }
@@ -596,6 +627,7 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
     const familyCounts = new Map<TextFontFamily, number>();
     let boldParts = 0;
     let italicParts = 0;
+    const weightCounts = new Map<number, number>();
     for (const part of line.parts) {
       const x = part.transform[4];
       const size = Math.hypot(part.transform[0], part.transform[1]) || 10;
@@ -615,6 +647,8 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
       familyCounts.set(fam, (familyCounts.get(fam) ?? 0) + 1);
       if (part.fontName && boldFontNames.has(part.fontName)) boldParts++;
       if (part.fontName && italicFontNames.has(part.fontName)) italicParts++;
+      const wt = (part.fontName && weightByFont.get(part.fontName)) || 400;
+      weightCounts.set(wt, (weightCounts.get(wt) ?? 0) + 1);
     }
     let color = '#000000';
     let bestColorCount = 0;
@@ -636,6 +670,14 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
     // most of its characters were drawn with a bold/italic-named font
     const bold = boldParts > line.parts.length / 2;
     const italic = italicParts > line.parts.length / 2;
+    let weight = bold ? 700 : 400;
+    let bestWeightCount = 0;
+    for (const [wt, count] of weightCounts) {
+      if (count > bestWeightCount && wt >= 600 === bold) {
+        bestWeightCount = count;
+        weight = wt;
+      }
+    }
     return {
       text,
       x: minX,
@@ -643,6 +685,7 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
       y: line.y,
       bold,
       italic,
+      weight,
       fontSize: sizeSum / line.parts.length,
       color,
       fontFamily,
@@ -771,46 +814,62 @@ async function extractPageImages(
 // Custom (non-standard) font files, served from /public/fonts and used both
 // for on-screen preview (via @font-face in index.css) and for real PDF
 // embedding here, so what you see while typing matches the export exactly.
-// Display/Handwriting/Condensed only have a Regular file — Bold/Italic
-// toggles still work on-screen (the browser synthesizes them visually
-// for any font), but the exported PDF for those three specifically will
-// render at Regular weight/style regardless, since no genuine bold or
-// italic glyph outlines exist to embed. Poppins/Montserrat/Roboto have
-// real Bold and Italic files (no combined Bold-Italic file was sourced,
-// so both-at-once falls back to the Bold face).
-const CUSTOM_FONT_FILES: Record<
-  string,
-  { regular: string; bold?: string; italic?: string }
-> = {
+// Each family lists the real faces we ship; a weight/style without its own
+// file falls back to the nearest one (see fontFileFor). Display, Handwriting
+// and Condensed only have a Regular file — Bold/Italic still show on screen
+// (the browser synthesizes them) but export at Regular.
+interface FontFaces {
+  regular: string;
+  italic?: string;
+  medium?: string;
+  mediumItalic?: string;
+  semibold?: string;
+  semiboldItalic?: string;
+  bold?: string;
+  boldItalic?: string;
+}
+const faces = (name: string, extra: (keyof FontFaces)[]): FontFaces => {
+  const file: Record<keyof FontFaces, string> = {
+    regular: 'Regular',
+    italic: 'Italic',
+    medium: 'Medium',
+    mediumItalic: 'MediumItalic',
+    semibold: 'SemiBold',
+    semiboldItalic: 'SemiBoldItalic',
+    bold: 'Bold',
+    boldItalic: 'BoldItalic',
+  };
+  const out: FontFaces = { regular: `/fonts/${name}-Regular.ttf` };
+  for (const k of extra) out[k] = `/fonts/${name}-${file[k]}.ttf`;
+  return out;
+};
+const CUSTOM_FONT_FILES: Record<string, FontFaces> = {
   Display: { regular: '/fonts/PlayfairDisplay.ttf' },
   Handwriting: { regular: '/fonts/GochiHand.ttf' },
   Condensed: { regular: '/fonts/Oswald.ttf' },
-  Poppins: {
-    regular: '/fonts/Poppins-Regular.ttf',
-    bold: '/fonts/Poppins-Bold.ttf',
-    italic: '/fonts/Poppins-Italic.ttf',
-  },
-  Montserrat: {
-    regular: '/fonts/Montserrat-Regular.ttf',
-    bold: '/fonts/Montserrat-Bold.ttf',
-    italic: '/fonts/Montserrat-Italic.ttf',
-  },
-  Roboto: {
-    regular: '/fonts/Roboto-Regular.ttf',
-    bold: '/fonts/Roboto-Bold.ttf',
-    italic: '/fonts/Roboto-Italic.ttf',
-  },
-  OpenSans: {
-    regular: '/fonts/OpenSans-Regular.ttf',
-    bold: '/fonts/OpenSans-Bold.ttf',
-    italic: '/fonts/OpenSans-Italic.ttf',
-  },
-  Merriweather: {
-    regular: '/fonts/Merriweather-Regular.ttf',
-    bold: '/fonts/Merriweather-Bold.ttf',
-    italic: '/fonts/Merriweather-Italic.ttf',
-  },
+  Poppins: faces('Poppins', ['italic', 'medium', 'mediumItalic', 'semibold', 'semiboldItalic', 'bold', 'boldItalic']),
+  Montserrat: faces('Montserrat', ['italic', 'medium', 'mediumItalic', 'semibold', 'semiboldItalic', 'bold', 'boldItalic']),
+  Roboto: faces('Roboto', ['italic', 'bold']),
+  OpenSans: faces('OpenSans', ['italic', 'bold']),
+  Merriweather: faces('Merriweather', ['italic', 'bold']),
+  Lato: faces('Lato', ['italic', 'semibold', 'bold', 'boldItalic']),
+  Barlow: faces('Barlow', ['italic', 'semibold', 'bold', 'boldItalic']),
+  FiraSans: faces('FiraSans', ['italic', 'semibold', 'bold', 'boldItalic']),
+  Ubuntu: faces('Ubuntu', ['italic', 'medium', 'bold', 'boldItalic']),
+  PTSans: faces('PTSans', ['italic', 'bold', 'boldItalic']),
+  PTSerif: faces('PTSerif', ['italic', 'bold', 'boldItalic']),
 };
+
+// The shipped face closest to the requested weight (400 regular, 500
+// medium, 600 semibold, 700+ bold) and style.
+function fontFileFor(files: FontFaces, weight: number, italic: boolean): string {
+  if (weight >= 700) return (italic ? files.boldItalic : undefined) ?? files.bold ?? files.semibold ?? files.regular;
+  if (weight >= 600) {
+    return (italic ? files.semiboldItalic ?? files.boldItalic : undefined) ?? files.semibold ?? files.bold ?? files.regular;
+  }
+  if (weight >= 500) return (italic ? files.mediumItalic ?? files.italic : undefined) ?? files.medium ?? files.regular;
+  return (italic ? files.italic : undefined) ?? files.regular;
+}
 const fontByteCache = new Map<string, ArrayBuffer>();
 async function fetchFontBytes(url: string): Promise<ArrayBuffer> {
   const cached = fontByteCache.get(url);
@@ -844,40 +903,41 @@ const STANDARD_VARIANTS: Record<string, Record<string, StandardFonts>> = {
 
 // Embeds one family/weight/style into pdfDoc, at most once per cache. The
 // doc must already have fontkit registered for the non-standard families.
-// Returns null if the font couldn't be embedded.
+// `weight` defaults to 700/400 from `bold`. Returns null if the font
+// couldn't be embedded.
 async function embedTextFont(
   pdfDoc: PDFDocument,
   family: TextFontFamily,
   bold: boolean,
   italic: boolean,
-  cache: Map<string, PDFFont>
+  cache: Map<string, PDFFont>,
+  weight: number = bold ? 700 : 400
 ): Promise<PDFFont | null> {
-  const combo = `${family}|${bold}|${italic}`;
+  const combo = `${family}|${weight}|${italic}`;
   const cached = cache.get(combo);
   if (cached) return cached;
-  const key = `${bold ? '1' : '0'}${italic ? '1' : '0'}`;
 
   if (STANDARD_VARIANTS[family]) {
+    const key = `${weight >= 600 ? '1' : '0'}${italic ? '1' : '0'}`;
     try {
       const f = await pdfDoc.embedFont(STANDARD_VARIANTS[family][key]);
       cache.set(combo, f);
       return f;
     } catch (e) {
-      console.warn(`Could not embed ${family} (bold=${bold}, italic=${italic}):`, e);
+      console.warn(`Could not embed ${family} (weight=${weight}, italic=${italic}):`, e);
       return null;
     }
   }
 
   const files = CUSTOM_FONT_FILES[family];
   if (!files) return null;
-  // no combined bold-italic file was sourced for these — bold wins if both are on
-  const fileUrl = bold ? files.bold ?? files.regular : italic ? files.italic ?? files.regular : files.regular;
   try {
-    const bytes = await fetchFontBytes(fileUrl);
-    // subset:false — these particular font files trip up fontkit's
-    // subsetter (verified independently before shipping this);
-    // embedding the full font avoids that at the cost of a larger file
-    const f = await pdfDoc.embedFont(bytes, { subset: false });
+    const bytes = await fetchFontBytes(fontFileFor(files, weight, italic));
+    // Subset to just the characters used: a whole font is 75-650KB per
+    // face, which made every edited PDF noticeably bigger. (Subsetting used
+    // to crash with @pdf-lib/fontkit; upstream fontkit 2 works for all of
+    // these files — verified by round-tripping each one through pdf.js.)
+    const f = await pdfDoc.embedFont(bytes, { subset: true });
     cache.set(combo, f);
     return f;
   } catch (e) {
@@ -895,6 +955,7 @@ interface LineEditJob {
   family: TextFontFamily;
   bold: boolean;
   italic: boolean;
+  weight: number;
   underline: boolean;
   sizePt: number;
   align: LineAlign;
@@ -910,6 +971,13 @@ function alignedLeftPt(job: LineEditJob, width: number, pageWidthPts: number): n
   if (job.align === 'right') return job.line.leftPt + lineWidthPts - width;
   if (job.align === 'center') return job.line.leftPt + (lineWidthPts - width) / 2;
   return job.line.leftPt;
+}
+
+// Toggling Bold sets a plain bold/regular weight; otherwise the line keeps
+// its detected one (Medium, SemiBold...).
+export function effectiveLineWeight(line: CachedLine, o?: Partial<LineStyleOverride>): number {
+  if (o?.bold !== undefined) return o.bold ? 700 : 400;
+  return line.weight ?? (line.bold ? 700 : 400);
 }
 
 function collectLineEditJobs(
@@ -941,6 +1009,7 @@ function collectLineEditJobs(
       family: o?.fontFamily ?? line.fontFamily,
       bold: o?.bold ?? line.bold,
       italic: o?.italic ?? line.italic,
+      weight: effectiveLineWeight(line, o),
       underline: o?.underline ?? false,
       // the line's real detected point size — not re-derived from its box
       // height, which is what made edited lines come out a different size
@@ -983,7 +1052,7 @@ async function bakeLineEditsAsVector(
 
   const prepared: { job: LineEditJob; font: PDFFont; text: string; width: number }[] = [];
   for (const job of jobs) {
-    const font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache);
+    const font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache, job.weight);
     if (!font) return false;
     const text = job.text.replace(/\t/g, '    ');
     let width: number;
@@ -1116,7 +1185,7 @@ async function coverAndDrawLineEdits(
 
   for (const job of jobs) {
     const { baselinePt: y, color } = job.line;
-    let font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache);
+    let font = await embedTextFont(pdfDoc, job.family, job.bold, job.italic, fontCache, job.weight);
     const text = job.text.replace(/\t/g, '    ');
     let width = 0;
     try {
@@ -1125,7 +1194,7 @@ async function coverAndDrawLineEdits(
       font = null;
     }
     if (!font) {
-      font = await embedTextFont(pdfDoc, 'Helvetica', job.bold, job.italic, fontCache);
+      font = await embedTextFont(pdfDoc, 'Helvetica', job.bold, job.italic, fontCache, job.weight);
       try {
         width = font ? font.widthOfTextAtSize(text, job.sizePt) : 0;
       } catch {
@@ -1167,6 +1236,18 @@ async function coverAndDrawLineEdits(
 }
 
 // ---------- Documents ----------
+// Size on disk of each document as opened, for honest compression numbers.
+// Keyed by the loaded pdf-lib doc, so it lapses once Apply etc. replace it.
+const loadedFileSize = new WeakMap<PDFDocument, number>();
+
+export interface CompressResult extends CompressStats {
+  originalSize: number;
+  compressedSize: number;
+  savedPct: number;
+  saved: boolean; // false when nothing smaller could be made, so no file was written
+  fontBytesSaved: number; // from removing unused characters from embedded fonts
+}
+
 export interface OpenDocument {
   id: string;
   name: string;
@@ -1402,7 +1483,7 @@ interface DocumentState {
   compressDocument: (
     docId: string,
     level: 'easy' | 'medium' | 'hard'
-  ) => Promise<{ originalSize: number; compressedSize: number; savedPct: number } | null>;
+  ) => Promise<CompressResult | null>;
   findTextInDocument: (docId: string, query: string, fromPage: number) => Promise<number | null>;
   applyCrop: (
     docId: string,
@@ -1415,6 +1496,45 @@ interface DocumentState {
   convertWordToPdf: (file: File) => Promise<{ ok: true } | { ok: false; error: string }>;
   saveSignature: (name: string, dataUrl: string, w: number, h: number) => void;
   deleteSavedSignature: (id: string) => void;
+}
+
+// Renders every page of two versions of a document and checks they look the
+// same — the safety net for compression steps that rewrite fonts.
+async function pagesRenderIdentically(
+  a: Uint8Array,
+  b: Uint8Array,
+  onPage?: (page: number, total: number) => void
+): Promise<boolean> {
+  const [da, db] = await Promise.all([bytesToProxy(a.slice()), bytesToProxy(b.slice())]);
+  try {
+    if (da.numPages !== db.numPages) return false;
+    const draw = async (doc: PDFDocumentProxy, n: number) => {
+      const page = await doc.getPage(n);
+      const viewport = page.getViewport({ scale: 1.5 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+      return ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    };
+    for (let n = 1; n <= da.numPages; n++) {
+      onPage?.(n, da.numPages);
+      const [pa, pb] = await Promise.all([draw(da, n), draw(db, n)]);
+      if (pa.length !== pb.length) return false;
+      let differing = 0;
+      for (let k = 0; k < pa.length; k += 4) {
+        if (Math.abs(pa[k] - pb[k]) > 24 || Math.abs(pa[k + 1] - pb[k + 1]) > 24 || Math.abs(pa[k + 2] - pb[k + 2]) > 24) {
+          differing++;
+        }
+      }
+      if (differing > pa.length / 4 / 5000) return false; // more than 0.02% of the page
+    }
+    return true;
+  } finally {
+    void da.loadingTask.destroy();
+    void db.loadingTask.destroy();
+  }
 }
 
 async function bytesToProxy(bytes: Uint8Array): Promise<PDFDocumentProxy> {
@@ -1501,6 +1621,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
         throw e;
       }
     }
+    loadedFileSize.set(pdfLibDoc, buf.length);
     const proxy = await bytesToProxy(buf);
     const doc: OpenDocument = {
       id: `${file.name}-${Date.now()}`,
@@ -2204,113 +2325,47 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   compressDocument: async (docId, level) => {
     const doc = get().documents.find((d) => d.id === docId);
     if (!doc) return null;
-
-    const PRESETS = {
-      easy: { scale: 2.2, quality: 0.92, threshold: 0.35 },
-      medium: { scale: 1.6, quality: 0.75, threshold: 0.18 },
-      hard: { scale: 1.1, quality: 0.5, threshold: 0.08 },
-    } as const;
-    const preset = PRESETS[level];
-
     set({ ocrProgress: { active: true, label: 'Compressing', pct: 0 } });
-
     try {
-      const newDoc = await PDFDocument.create();
-      const totalPages = doc.pdfLibDoc.getPageCount();
-      const OPS = pdfjsLib.OPS;
-
-      for (let i = 0; i < totalPages; i++) {
+      const current = await doc.pdfLibDoc.save();
+      // compare against the file as it is on disk, not a re-save of it —
+      // that's the number the user sees in Explorer
+      const originalSize = loadedFileSize.get(doc.pdfLibDoc) ?? current.length;
+      const work = await PDFDocument.load(current, { updateMetadata: false });
+      const stats = await compressPdfInPlace(work, level, (done, total) =>
         set({
           ocrProgress: {
             active: true,
-            label: `Page ${i + 1} of ${totalPages}`,
-            pct: Math.round((i / totalPages) * 100),
+            label: total ? `Shrinking photos (${done} of ${total})` : 'Compressing',
+            pct: total ? Math.round((done / total) * 90) : 50,
           },
-        });
-        const pageNum = i + 1;
-        const pdfPage = await doc.proxy.getPage(pageNum);
-        const viewport1 = pdfPage.getViewport({ scale: 1 });
-        const pageAreaPts = viewport1.width * viewport1.height;
-
-        // measure how much of the page is actually covered by images
-        let imageAreaPts = 0;
-        try {
-          const opList = await pdfPage.getOperatorList();
-          let ctm = [1, 0, 0, 1, 0, 0];
-          const stack: number[][] = [];
-          for (let k = 0; k < opList.fnArray.length; k++) {
-            const fn = opList.fnArray[k];
-            const args = opList.argsArray[k];
-            if (fn === OPS.save) {
-              stack.push(ctm);
-            } else if (fn === OPS.restore) {
-              ctm = stack.pop() ?? ctm;
-            } else if (fn === OPS.transform) {
-              ctm = multiplyMatrix(ctm, args as number[]);
-            } else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
-              const corners = [
-                [0, 0],
-                [1, 0],
-                [0, 1],
-                [1, 1],
-              ].map(([ux, uy]) => [
-                ctm[0] * ux + ctm[2] * uy + ctm[4],
-                ctm[1] * ux + ctm[3] * uy + ctm[5],
-              ]);
-              const xs = corners.map((c) => c[0]);
-              const ys = corners.map((c) => c[1]);
-              const w = Math.max(...xs) - Math.min(...xs);
-              const h = Math.max(...ys) - Math.min(...ys);
-              imageAreaPts += Math.max(0, w * h);
-            }
-          }
-        } catch {
-          imageAreaPts = 0;
-        }
-        const imageFraction = pageAreaPts > 0 ? imageAreaPts / pageAreaPts : 0;
-
-        if (imageFraction >= preset.threshold) {
-          // image-heavy page: rasterize and re-encode as JPEG at the
-          // preset's quality/resolution — this is where the size savings
-          // actually come from
-          const viewport = pdfPage.getViewport({ scale: preset.scale });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext('2d')!;
-          ctx.fillStyle = '#FFFFFF'; // JPEG has no alpha channel
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          await pdfPage.render({ canvasContext: ctx, viewport, canvas }).promise;
-          const dataUrl = canvas.toDataURL('image/jpeg', preset.quality);
-          const jpgBytes = Uint8Array.from(atob(dataUrl.split(',')[1]), (c) => c.charCodeAt(0));
-          const embedded = await newDoc.embedJpg(jpgBytes);
-          const originalSize = doc.pdfLibDoc.getPage(i).getSize();
-          const newPage = newDoc.addPage([originalSize.width, originalSize.height]);
-          newPage.drawImage(embedded, {
-            x: 0,
-            y: 0,
-            width: originalSize.width,
-            height: originalSize.height,
-          });
-        } else {
-          // text/vector page: copy through completely unchanged — no
-          // quality loss, stays selectable and searchable, and doesn't
-          // get bloated by needless rasterization
-          const [copied] = await newDoc.copyPages(doc.pdfLibDoc, [i]);
-          newDoc.addPage(copied);
+        })
+      );
+      // Embedded fonts: often the bulk of Word/"Print to PDF" output. Only
+      // kept if every page still renders pixel-for-pixel the same.
+      const beforeFonts = await work.save({ useObjectStreams: true });
+      const strip = stripUnusedGlyphs(work);
+      let fontBytesSaved = 0;
+      if (strip.fonts > 0) {
+        const afterFonts = await work.save({ useObjectStreams: true });
+        const same = await pagesRenderIdentically(beforeFonts, afterFonts, (p, total) =>
+          set({ ocrProgress: { active: true, label: `Checking pages (${p} of ${total})`, pct: 90 + Math.round((p / total) * 10) } })
+        );
+        if (same) fontBytesSaved = strip.saved;
+        else {
+          console.warn('Font slimming changed how a page looks; keeping the original fonts.');
+          strip.restore();
         }
       }
-
-      const outBytes = await newDoc.save({ useObjectStreams: true });
-      const originalBytes = await doc.pdfLibDoc.save();
-      const savedPct = Math.max(
-        0,
-        Math.round((1 - outBytes.length / originalBytes.length) * 100)
-      );
-
-      downloadBlob(outBytes, `compressed-${level}-${doc.name}`);
+      const outBytes = await work.save({ useObjectStreams: true });
       set({ ocrProgress: null });
-      return { originalSize: originalBytes.length, compressedSize: outBytes.length, savedPct };
+      // never hand back a file that's bigger (or no smaller) than the original
+      if (outBytes.length >= originalSize * 0.98) {
+        return { originalSize, compressedSize: originalSize, savedPct: 0, saved: false, fontBytesSaved, ...stats };
+      }
+      downloadBlob(outBytes, `compressed-${level}-${doc.name}`);
+      const savedPct = Math.round((1 - outBytes.length / originalSize) * 100);
+      return { originalSize, compressedSize: outBytes.length, savedPct, saved: true, fontBytesSaved, ...stats };
     } catch (e) {
       console.error('Compression failed:', e);
       set({ ocrProgress: null });
@@ -3444,7 +3499,6 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           const override = styleOverridesHere[idx];
           const newText = editsHere[idx] ?? line.text;
           const effectiveFamily = override?.fontFamily ?? line.fontFamily;
-          const effectiveBold = override?.bold ?? line.bold;
           const effectiveItalic = override?.italic ?? line.italic;
           const effectiveUnderline = override?.underline ?? false;
           const effectiveFontSizePt = override?.fontSize ?? line.fontSizePt;
@@ -3482,23 +3536,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           // the line's real point size, not an estimate from its box height
           // (which came out ~8% small and made edited lines visibly shrink)
           const fontPx = effectiveFontSizePt * scale;
-          const canvasFontStack =
-            effectiveFamily === 'TimesRoman'
-              ? '"Times New Roman", Times, serif'
-              : effectiveFamily === 'Courier'
-              ? '"Courier New", Courier, monospace'
-              : effectiveFamily === 'Poppins'
-              ? '"PDFSuite Poppins", Arial, sans-serif'
-              : effectiveFamily === 'Montserrat'
-              ? '"PDFSuite Montserrat", Arial, sans-serif'
-              : effectiveFamily === 'Roboto'
-              ? '"PDFSuite Roboto", Arial, sans-serif'
-              : effectiveFamily === 'OpenSans'
-              ? '"PDFSuite OpenSans", Arial, sans-serif'
-              : effectiveFamily === 'Merriweather'
-              ? '"PDFSuite Merriweather", Georgia, serif'
-              : 'Helvetica, Arial, sans-serif';
-          const weightPrefix = effectiveBold ? 'bold ' : '';
+          const canvasFontStack = FONT_FAMILY_CSS[effectiveFamily] ?? FONT_FAMILY_CSS.Helvetica;
+          const weightPrefix = `${effectiveLineWeight(line, override)} `;
           const stylePrefix = effectiveItalic ? 'italic ' : '';
           ctx.font = `${stylePrefix}${weightPrefix}${fontPx}px ${canvasFontStack}`;
           const measuredTextWidth = newText.trim() ? ctx.measureText(newText).width : 0;
@@ -3762,6 +3801,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
           fontFamily: l.fontFamily,
           bold: l.bold,
           italic: l.italic,
+          weight: l.weight,
           align: 'left' as LineAlign,
         };
       });

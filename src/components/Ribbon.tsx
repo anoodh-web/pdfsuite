@@ -59,7 +59,7 @@ import {
   Mail,
   Smartphone,
 } from 'lucide-react';
-import { useDocumentStore } from '../store/useDocumentStore';
+import { useDocumentStore, type CompressResult } from '../store/useDocumentStore';
 import DigitalSignatureModal from './DigitalSignatureModal';
 import BatchProcessor from './BatchProcessor';
 import OrganizePagesModal from './OrganizePagesModal';
@@ -286,11 +286,7 @@ export default function Ribbon() {
   };
   const [converting, setConverting] = useState(false);
   const [convertError, setConvertError] = useState<string | null>(null);
-  const [compressResult, setCompressResult] = useState<{
-    originalSize: number;
-    compressedSize: number;
-    savedPct: number;
-  } | null>(null);
+  const [compressResult, setCompressResult] = useState<CompressResult | null>(null);
   const [findQuery, setFindQuery] = useState('');
   const [findStatus, setFindStatus] = useState<string | null>(null);
 
@@ -389,7 +385,15 @@ export default function Ribbon() {
     setConvertError(null);
     setCompressResult(null);
     const result = await compressDocument(doc.id, level);
-    if (result) {
+    if (result && !result.saved) {
+      // nothing smaller was possible: say why instead of saving a bigger copy
+      setCompressResult(result);
+      showToast(
+        result.images === 0
+          ? 'Nothing to compress — this PDF is already compact (no large photos or oversized fonts).'
+          : `This PDF is already about as small as "${level}" can make it — no file was saved.`
+      );
+    } else if (result) {
       setCompressResult(result);
       showToast(
         `Compressed successfully — ${formatBytes(result.originalSize)} \u2192 ${formatBytes(result.compressedSize)} (${result.savedPct}% smaller).`
@@ -797,12 +801,27 @@ export default function Ribbon() {
                 onClick={() => doc && handleCompress('hard')}
               />
             </RibbonGroup>
-            {compressResult && (
+            {compressResult?.saved && (
               <div className="flex items-center px-4 text-[11px] text-signal-success">
                 {formatBytes(compressResult.originalSize)} → {formatBytes(compressResult.compressedSize)}
-                {' '}({compressResult.savedPct}% smaller)
+                {' '}({compressResult.savedPct}% smaller
+                {compressResult.recompressed > 0 &&
+                  `, ${compressResult.recompressed} photo${compressResult.recompressed === 1 ? '' : 's'} optimized`}
+                {compressResult.fontBytesSaved > 0 && `, ${formatBytes(compressResult.fontBytesSaved)} of unused font data removed`}
+                )
               </div>
             )}
+            {compressResult && !compressResult.saved && (
+              <div className="flex items-center px-4 text-[11px] text-muted">
+                {compressResult.images === 0
+                  ? 'Nothing left to shrink — this file is already compact. No copy saved.'
+                  : 'Already as small as this level allows — try a stronger level. No copy saved.'}
+              </div>
+            )}
+            <div className="flex max-w-[260px] items-center px-2 text-[10px] leading-snug text-muted">
+              Easy keeps photos print-sharp (200 dpi), Medium suits screens and email (144 dpi), Hard is
+              smallest (96 dpi). Text always stays sharp and selectable.
+            </div>
             {convertError && (
               <div className="flex items-center px-4 text-[11px] text-signal-danger">
                 {convertError}

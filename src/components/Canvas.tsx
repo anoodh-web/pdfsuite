@@ -8,6 +8,7 @@ import {
   lineOverflows,
   fitFontSize,
   planLineWrap,
+  effectiveLineWeight,
   type Annotation,
   type CachedLine,
   type LineAlign,
@@ -25,10 +26,18 @@ function uid() {
 // instead of staying clamped to the original line's detected width (which
 // was clipping/hiding any text appended past that original length).
 const measureCanvas = document.createElement('canvas');
-function measureTextWidthPx(text: string, fontPx: number, fontFamily: string, bold = false, italic = false): number {
+// `weight` is true/false for bold/regular, or an exact CSS weight (500, 600...)
+function measureTextWidthPx(
+  text: string,
+  fontPx: number,
+  fontFamily: string,
+  weight: boolean | number = false,
+  italic = false
+): number {
   const ctx = measureCanvas.getContext('2d');
   if (!ctx) return 0;
-  ctx.font = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontPx}px ${fontFamily}`;
+  const w = weight === true ? 700 : weight === false ? 400 : weight;
+  ctx.font = `${italic ? 'italic ' : ''}${w} ${fontPx}px ${fontFamily}`;
   return ctx.measureText(text || ' ').width;
 }
 
@@ -256,6 +265,7 @@ export default function Canvas() {
       return {
         family: o?.fontFamily ?? l.fontFamily,
         bold: o?.bold ?? l.bold,
+        weight: effectiveLineWeight(l, o),
         italic: o?.italic ?? l.italic,
         sizePt: o?.fontSize ?? l.fontSizePt,
         align: o?.align ?? l.align,
@@ -271,7 +281,7 @@ export default function Canvas() {
       measure: (l, text) => {
         const st = styleOf(l);
         return pageSize.w
-          ? measureTextWidthPx(text, st.sizePt * scale, FONT_FAMILY_CSS[st.family], st.bold, st.italic) / pageSize.w
+          ? measureTextWidthPx(text, st.sizePt * scale, FONT_FAMILY_CSS[st.family], st.weight, st.italic) / pageSize.w
           : 0;
       },
     };
@@ -1292,6 +1302,7 @@ export default function Canvas() {
               const effFamily = styleOverride?.fontFamily ?? line.fontFamily;
               const effSize = styleOverride?.fontSize;
               const effBold = styleOverride?.bold ?? line.bold;
+              const effWeight = effectiveLineWeight(line, styleOverride);
               const effItalic = styleOverride?.italic ?? line.italic;
               const effUnderline = styleOverride?.underline ?? false;
               const fontPx = effSize
@@ -1313,7 +1324,7 @@ export default function Canvas() {
               const obstaclesOnPage = pageObstacles[doc.id]?.[currentPage] ?? [];
               const shownText = isEditing ? lineDraft : displayText;
               const shownWidth = pageSize.w
-                ? measureTextWidthPx(shownText, fontPx, fontFamilyCss, effBold, effItalic) / pageSize.w
+                ? measureTextWidthPx(shownText, fontPx, fontFamilyCss, effWeight, effItalic) / pageSize.w
                 : 0;
               const overflows =
                 (isEditing || hasOverride) &&
@@ -1371,7 +1382,7 @@ export default function Canvas() {
                           lineHeight: 1,
                           color: line.color,
                           fontFamily: fontFamilyCss,
-                          fontWeight: effBold ? 'bold' : 'normal',
+                          fontWeight: effWeight,
                           fontStyle: effItalic ? 'italic' : 'normal',
                           textDecoration: effUnderline ? 'underline' : 'none',
                           // Same sampled real background used for the
@@ -1390,7 +1401,7 @@ export default function Canvas() {
                           // grows live as you type, instead of only
                           // resizing after the edit is committed
                           width: `${Math.max(
-                            measureTextWidthPx(lineDraft, fontPx, fontFamilyCss, effBold, effItalic) + 16,
+                            measureTextWidthPx(lineDraft, fontPx, fontFamilyCss, effWeight, effItalic) + 16,
                             line.w * pageSize.w
                           )}px`,
                         }}
@@ -1529,7 +1540,7 @@ export default function Canvas() {
                         paddingBottom: `${Math.max(0, (1 - LINE_BASELINE_RATIO) * line.h * pageSize.h * zoom - fontPx * 0.08)}px`,
                         color: line.color,
                         fontFamily: fontFamilyCss,
-                        fontWeight: effBold ? 'bold' : 'normal',
+                        fontWeight: effWeight,
                         fontStyle: effItalic ? 'italic' : 'normal',
                         textDecoration: effUnderline ? 'underline' : 'none',
                       }}

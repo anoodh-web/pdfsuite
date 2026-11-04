@@ -46,19 +46,58 @@
   src: url('/fonts/Merriweather-Regular.ttf') format('truetype');
   font-display: swap;
 }
-/* Real Bold/Italic faces for the families that have them, so a bold line
-   being edited previews in the same genuine bold that gets embedded on
-   Apply/export, instead of the browser's synthesized (smeared) bold. */
-@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-Bold.ttf') format('truetype'); font-weight: bold; font-display: swap; }
-@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-Italic.ttf') format('truetype'); font-style: italic; font-display: swap; }
-@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-Bold.ttf') format('truetype'); font-weight: bold; font-display: swap; }
-@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-Italic.ttf') format('truetype'); font-style: italic; font-display: swap; }
-@font-face { font-family: 'PDFSuite Roboto'; src: url('/fonts/Roboto-Bold.ttf') format('truetype'); font-weight: bold; font-display: swap; }
-@font-face { font-family: 'PDFSuite Roboto'; src: url('/fonts/Roboto-Italic.ttf') format('truetype'); font-style: italic; font-display: swap; }
-@font-face { font-family: 'PDFSuite OpenSans'; src: url('/fonts/OpenSans-Bold.ttf') format('truetype'); font-weight: bold; font-display: swap; }
-@font-face { font-family: 'PDFSuite OpenSans'; src: url('/fonts/OpenSans-Italic.ttf') format('truetype'); font-style: italic; font-display: swap; }
-@font-face { font-family: 'PDFSuite Merriweather'; src: url('/fonts/Merriweather-Bold.ttf') format('truetype'); font-weight: bold; font-display: swap; }
-@font-face { font-family: 'PDFSuite Merriweather'; src: url('/fonts/Merriweather-Italic.ttf') format('truetype'); font-style: italic; font-display: swap; }
+/* Every real weight/style we ship, so a line being edited previews in the
+   same genuine face that gets embedded on Apply/export (Medium, SemiBold,
+   Bold, Italic...) instead of the browser's synthesized bold or slant.
+   Keep in sync with CUSTOM_FONT_FILES in the store. */
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-Medium.ttf') format('truetype'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-MediumItalic.ttf') format('truetype'); font-weight: 500; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-SemiBold.ttf') format('truetype'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-SemiBoldItalic.ttf') format('truetype'); font-weight: 600; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Poppins'; src: url('/fonts/Poppins-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-Medium.ttf') format('truetype'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-MediumItalic.ttf') format('truetype'); font-weight: 500; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-SemiBold.ttf') format('truetype'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-SemiBoldItalic.ttf') format('truetype'); font-weight: 600; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Montserrat'; src: url('/fonts/Montserrat-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Roboto'; src: url('/fonts/Roboto-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Roboto'; src: url('/fonts/Roboto-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite OpenSans'; src: url('/fonts/OpenSans-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite OpenSans'; src: url('/fonts/OpenSans-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Merriweather'; src: url('/fonts/Merriweather-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Merriweather'; src: url('/fonts/Merriweather-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Lato'; src: url('/fonts/Lato-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Lato'; src: url('/fonts/Lato-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Lato'; src: url('/fonts/Lato-SemiBold.ttf') format('truetype'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Lato'; src: url('/fonts/Lato-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Lato'; src: url('/fonts/Lato-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Barlow'; src: url('/fonts/Barlow-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Barlow'; src: url('/fonts/Barlow-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Barlow'; src: url('/fonts/Barlow-SemiBold.ttf') format('truetype'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Barlow'; src: url('/fonts/Barlow-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Barlow'; src: url('/fonts/Barlow-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite FiraSans'; src: url('/fonts/FiraSans-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite FiraSans'; src: url('/fonts/FiraSans-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite FiraSans'; src: url('/fonts/FiraSans-SemiBold.ttf') format('truetype'); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite FiraSans'; src: url('/fonts/FiraSans-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite FiraSans'; src: url('/fonts/FiraSans-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Ubuntu'; src: url('/fonts/Ubuntu-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Ubuntu'; src: url('/fonts/Ubuntu-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite Ubuntu'; src: url('/fonts/Ubuntu-Medium.ttf') format('truetype'); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Ubuntu'; src: url('/fonts/Ubuntu-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite Ubuntu'; src: url('/fonts/Ubuntu-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSans'; src: url('/fonts/PTSans-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSans'; src: url('/fonts/PTSans-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSans'; src: url('/fonts/PTSans-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSans'; src: url('/fonts/PTSans-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSerif'; src: url('/fonts/PTSerif-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSerif'; src: url('/fonts/PTSerif-Italic.ttf') format('truetype'); font-weight: 400; font-style: italic; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSerif'; src: url('/fonts/PTSerif-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+@font-face { font-family: 'PDFSuite PTSerif'; src: url('/fonts/PTSerif-BoldItalic.ttf') format('truetype'); font-weight: 700; font-style: italic; font-display: swap; }
 
 /* Signature script fonts — used only in the Type Signature modal, where
    a signature is drawn/typed then captured as an image, so these only

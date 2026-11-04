@@ -12,6 +12,12 @@ const FAMILIES: { value: TextFontFamily; label: string; css: string; group: stri
   { value: 'Roboto', label: 'Roboto', css: '"PDFSuite Roboto", Arial, sans-serif', group: 'New' },
   { value: 'OpenSans', label: 'Open Sans', css: '"PDFSuite OpenSans", Arial, sans-serif', group: 'New' },
   { value: 'Merriweather', label: 'Merriweather', css: '"PDFSuite Merriweather", Georgia, serif', group: 'New' },
+  { value: 'Lato', label: 'Lato', css: '"PDFSuite Lato", Arial, sans-serif', group: 'New' },
+  { value: 'Barlow', label: 'Barlow', css: '"PDFSuite Barlow", Arial, sans-serif', group: 'New' },
+  { value: 'FiraSans', label: 'Fira Sans', css: '"PDFSuite FiraSans", Arial, sans-serif', group: 'New' },
+  { value: 'Ubuntu', label: 'Ubuntu', css: '"PDFSuite Ubuntu", Arial, sans-serif', group: 'New' },
+  { value: 'PTSans', label: 'PT Sans', css: '"PDFSuite PTSans", Arial, sans-serif', group: 'New' },
+  { value: 'PTSerif', label: 'PT Serif', css: '"PDFSuite PTSerif", Georgia, serif', group: 'New' },
 ];
 
 export const FONT_FAMILY_CSS: Record<TextFontFamily, string> = Object.fromEntries(

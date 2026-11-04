@@ -232,6 +232,7 @@ export interface LineStyle {
   family: CachedLine['fontFamily'];
   bold: boolean;
   italic: boolean;
+  weight: number;
   sizePt: number;
   align: LineAlign;
 }
@@ -409,6 +410,7 @@ export function planLineWrap(ctx: WrapContext, start: CachedLine, text: string):
       fontFamily: lastStyle.family,
       bold: lastStyle.bold,
       italic: lastStyle.italic,
+      weight: lastStyle.weight,
       align,
       synthetic: true,
     };
