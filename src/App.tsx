@@ -8,6 +8,7 @@ import StatusBar from './components/StatusBar';
 import PasswordPrompt from './components/PasswordPrompt';
 import BottomDock from './components/BottomDock';
 import Toast from './components/Toast';
+import UnsavedChangesPrompt from './components/UnsavedChangesPrompt';
 import OnboardingPrompt from './components/OnboardingPrompt';
 import FileAssociationHandler from './components/FileAssociationHandler';
 import { useDocumentStore } from './store/useDocumentStore';
@@ -40,6 +41,7 @@ export default function App() {
       <StatusBar />
       <PasswordPrompt />
       <Toast />
+      <UnsavedChangesPrompt />
       <FileAssociationHandler />
       {!userProfile && !onboardingDismissed && (
         <OnboardingPrompt onDone={() => setOnboardingDismissed(true)} />

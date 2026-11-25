@@ -209,3 +209,16 @@ body {
   background: rgba(62, 111, 243, 0.35);
 }
 
+
+/* notification slide-in */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: none; }
+}
+.toast-in { animation: toast-in 180ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .toast-in { animation: none; }
+}
+
+/* a thin, visible scrollbar so it's clear the ribbon has more tools to the right */
+.ribbon-scroll { scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 0.25) transparent; }

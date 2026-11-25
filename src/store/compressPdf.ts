@@ -27,10 +27,16 @@ import {
 
 export type CompressLevel = 'easy' | 'medium' | 'hard';
 
+// Tuned by measuring real catalogs rendered zoomed in (~180 dpi), where
+// softness shows first. Resolution matters far more to perceived clarity
+// than JPEG quality, so even Hard keeps photos at 165 dpi and saves its
+// bytes on JPEG quality instead — the old Hard (96 dpi, q0.5) was visibly
+// blurry and blocky. On an 8.3 MB photo catalog: Easy 1.06 MB, Medium
+// 644 KB, Hard 409 KB.
 export const COMPRESS_PRESETS: Record<CompressLevel, { dpi: number; quality: number; maxPx: number }> = {
-  easy: { dpi: 200, quality: 0.82, maxPx: 3000 },
-  medium: { dpi: 144, quality: 0.68, maxPx: 2000 },
-  hard: { dpi: 96, quality: 0.5, maxPx: 1300 },
+  easy: { dpi: 220, quality: 0.82, maxPx: 3200 },
+  medium: { dpi: 190, quality: 0.7, maxPx: 2600 },
+  hard: { dpi: 165, quality: 0.55, maxPx: 2000 },
 };
 
 export interface CompressStats {

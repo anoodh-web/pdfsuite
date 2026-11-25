@@ -1,5 +1,17 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AlignCenter, AlignLeft, AlignRight, FilePlus2, FileWarning, TriangleAlert, WrapText, X } from 'lucide-react';
+import {
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
+  Bold as BoldIcon,
+  FilePlus2,
+  FileWarning,
+  Italic as ItalicIcon,
+  TriangleAlert,
+  Underline as UnderlineIcon,
+  WrapText,
+  X,
+} from 'lucide-react';
 import { RenderingCancelledException, TextLayer, type RenderTask } from 'pdfjs-dist';
 import {
   useDocumentStore,
@@ -570,6 +582,19 @@ export default function Canvas() {
   const handleMouseDown = (e: React.MouseEvent) => {
     if (!doc) return;
     const pos = relPos(e);
+    // Tools that create something to type into: the new box mounts with
+    // autoFocus during this mousedown, and the browser's default mousedown
+    // action then moved focus to the page, blurring it at once — so a new
+    // text box closed immediately as "(empty text)" and its Bold/Italic/
+    // Underline toolbar never appeared.
+    if (
+      activeTool === 'type-text' ||
+      activeTool === 'note' ||
+      activeTool === 'signature' ||
+      activeTool?.startsWith('form-')
+    ) {
+      e.preventDefault();
+    }
     if (activeTool === 'highlight' || activeTool === 'fill' || activeTool === 'redact' || activeTool === 'erase' || activeTool === 'crop') {
       setDrag(pos);
       setDragNow(pos);
@@ -1087,6 +1112,14 @@ export default function Canvas() {
                         onChange={(e) =>
                           updateTextBoxText(doc.id, currentPage, a.id, e.target.value)
                         }
+                        onKeyDown={(e) => {
+                          if (!(e.ctrlKey || e.metaKey)) return;
+                          const k = e.key.toLowerCase();
+                          const style = k === 'b' ? 'bold' : k === 'i' ? 'italic' : k === 'u' ? 'underline' : null;
+                          if (!style) return;
+                          e.preventDefault();
+                          toggleTextBoxStyle(doc.id, currentPage, a.id, style);
+                        }}
                         style={{
                           color: a.color,
                           fontSize: `${a.fontSize * zoom * 1.4}px`,
@@ -1100,31 +1133,29 @@ export default function Canvas() {
                         placeholder="Type…"
                       />
                       <div className="mt-1 flex flex-col gap-1">
-                        <div className="flex gap-0.5 rounded bg-ink-700 p-0.5">
-                          <button
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'bold')}
-                            className={`rounded px-1 text-[10px] font-bold ${a.bold ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
-                            title="Bold"
-                          >
-                            B
-                          </button>
-                          <button
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'italic')}
-                            className={`rounded px-1 text-[10px] italic ${a.italic ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
-                            title="Italic"
-                          >
-                            I
-                          </button>
-                          <button
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, 'underline')}
-                            className={`rounded px-1 text-[10px] underline ${a.underline ? 'bg-accent text-white' : 'text-muted hover:text-paper'}`}
-                            title="Underline"
-                          >
-                            U
-                          </button>
+                        {/* keepLineEditorFocus prevents the mousedown from
+                            blurring the textarea — the blur closed the box,
+                            unmounting these buttons before the click landed,
+                            so Bold/Italic/Underline never actually applied */}
+                        <div className="flex gap-0.5 rounded-md bg-ink-700 p-1 shadow">
+                          {(
+                            [
+                              ['bold', BoldIcon, 'Bold (Ctrl+B)', a.bold],
+                              ['italic', ItalicIcon, 'Italic (Ctrl+I)', a.italic],
+                              ['underline', UnderlineIcon, 'Underline (Ctrl+U)', a.underline],
+                            ] as const
+                          ).map(([style, Icon, label, on]) => (
+                            <button
+                              key={style}
+                              onMouseDown={keepLineEditorFocus}
+                              onClick={() => toggleTextBoxStyle(doc.id, currentPage, a.id, style)}
+                              className={`flex h-6 w-6 items-center justify-center rounded ${on ? 'bg-accent text-white' : 'text-paper/80 hover:bg-ink-600'}`}
+                              title={label}
+                              aria-pressed={!!on}
+                            >
+                              <Icon size={14} strokeWidth={2.25} />
+                            </button>
+                          ))}
                         </div>
                         <X
                           size={12}

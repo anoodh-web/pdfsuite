@@ -156,7 +156,7 @@ export default function Ribbon() {
     createBlankDocument,
     getPrintUrl,
     getShareFile,
-    closeDocument,
+    requestCloseDocument,
     setActiveDocument,
     addImageAnnotation,
     runOcrOnPage,
@@ -365,13 +365,9 @@ export default function Ribbon() {
     setConverting(true);
     setConvertError(null);
     try {
-      if (exportFormat === 'word') {
-        await exportToWord(doc.id);
-        showToast('The file has been successfully converted to Word and saved.');
-      } else {
-        await exportToPng(doc.id);
-        showToast('The file has been successfully converted to PNG and saved.');
-      }
+      // the download itself shows the "Converted … saved" notification
+      if (exportFormat === 'word') await exportToWord(doc.id);
+      else await exportToPng(doc.id);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       setConvertError(message);
@@ -396,7 +392,7 @@ export default function Ribbon() {
     } else if (result) {
       setCompressResult(result);
       showToast(
-        `Compressed successfully — ${formatBytes(result.originalSize)} \u2192 ${formatBytes(result.compressedSize)} (${result.savedPct}% smaller).`
+        `Compressed — ${formatBytes(result.originalSize)} \u2192 ${formatBytes(result.compressedSize)} (${result.savedPct}% smaller), saved to your Downloads folder.`
       );
     } else {
       setConvertError('Compression failed — see the browser console for details.');
@@ -435,12 +431,9 @@ export default function Ribbon() {
         if (!result.ok) {
           setConvertError(result.error);
           showToast(`Conversion failed: ${result.error}`, 'error');
-        } else {
-          showToast('The file has been successfully converted and saved.');
         }
       } else {
         await createPdfFromImages(stagedImageFiles);
-        showToast('The file has been successfully converted and saved.');
       }
       setStagedWordFile(null);
       setStagedImageFiles([]);
@@ -521,7 +514,16 @@ export default function Ribbon() {
         ))}
       </div>
 
-      <div className="flex h-24 items-stretch overflow-x-auto bg-ink-700 px-2 py-1">
+      <div
+        className="ribbon-scroll flex h-24 items-stretch overflow-x-auto bg-ink-700 px-2 py-1"
+        // a plain mouse wheel scrolls the ribbon sideways when it doesn't fit
+        onWheel={(e) => {
+          const el = e.currentTarget;
+          if (el.scrollWidth > el.clientWidth && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+            el.scrollLeft += e.deltaY;
+          }
+        }}
+      >
         <input
           ref={fileInputRef}
           type="file"
@@ -642,26 +644,7 @@ export default function Ribbon() {
               <RibbonButton icon={Type} label="Type Text" large active={activeTool === 'type-text'} onClick={() => setActiveTool('type-text')} />
               <RibbonButton icon={FileSignature} label="Signature" large active={activeTool === 'signature'} onClick={() => setActiveTool('signature')} />
             </RibbonGroup>
-            <RibbonGroup title="Markup">
-              <RibbonButton icon={Highlighter} label="Highlight" large active={activeTool === 'highlight'} onClick={() => setActiveTool('highlight')} />
-              <RibbonButton icon={StickyNote} label="Sticky Note" large active={activeTool === 'note'} onClick={() => setActiveTool('note')} />
-              <RibbonButton icon={PenLine} label="Ink" large active={activeTool === 'ink'} onClick={() => setActiveTool('ink')} />
-              <RibbonButton icon={Check} label="Tick" large active={activeTool === 'stamp-tick'} onClick={() => setActiveTool('stamp-tick')} />
-              <RibbonButton icon={Circle} label="Dot" large active={activeTool === 'stamp-dot'} onClick={() => setActiveTool('stamp-dot')} />
-              <RibbonButton icon={MousePointer2} label="Select" large active={activeTool === 'select'} onClick={() => setActiveTool('select')} />
-            </RibbonGroup>
-            <RibbonGroup title="Edit & Erase">
-              <RibbonButton icon={TextCursorInput} label="Select Text & Delete" large active={activeTool === 'erase-text'} onClick={() => setActiveTool('erase-text')} />
-              <RibbonButton icon={Eraser} label="Erase Area" large active={activeTool === 'erase'} onClick={() => setActiveTool('erase')} />
-              <RibbonButton
-                icon={ShieldCheck}
-                label={pendingRedactions > 0 ? `Apply (${pendingRedactions})` : 'Apply'}
-                large
-                disabled={!doc || pendingRedactions === 0}
-                onClick={() => doc && applyRedactions(doc.id)}
-              />
-              <RibbonButton icon={Trash2} label="Delete Page" large disabled={!doc} onClick={() => doc && deletePage(doc.id, currentPage - 1)} />
-            </RibbonGroup>
+            {/* right next to the text tools so it's never scrolled out of view */}
             <RibbonGroup title="Format">
               <ColorPicker value={annotationColor} onChange={setAnnotationColor} label="Annotation color" />
               <RibbonButton icon={PaintBucket} label="Fill" active={activeTool === 'fill'} onClick={() => setActiveTool('fill')} />
@@ -758,6 +741,26 @@ export default function Ribbon() {
                 }}
               />
             </RibbonGroup>
+            <RibbonGroup title="Markup">
+              <RibbonButton icon={Highlighter} label="Highlight" large active={activeTool === 'highlight'} onClick={() => setActiveTool('highlight')} />
+              <RibbonButton icon={StickyNote} label="Sticky Note" large active={activeTool === 'note'} onClick={() => setActiveTool('note')} />
+              <RibbonButton icon={PenLine} label="Ink" large active={activeTool === 'ink'} onClick={() => setActiveTool('ink')} />
+              <RibbonButton icon={Check} label="Tick" large active={activeTool === 'stamp-tick'} onClick={() => setActiveTool('stamp-tick')} />
+              <RibbonButton icon={Circle} label="Dot" large active={activeTool === 'stamp-dot'} onClick={() => setActiveTool('stamp-dot')} />
+              <RibbonButton icon={MousePointer2} label="Select" large active={activeTool === 'select'} onClick={() => setActiveTool('select')} />
+            </RibbonGroup>
+            <RibbonGroup title="Edit & Erase">
+              <RibbonButton icon={TextCursorInput} label="Select Text & Delete" large active={activeTool === 'erase-text'} onClick={() => setActiveTool('erase-text')} />
+              <RibbonButton icon={Eraser} label="Erase Area" large active={activeTool === 'erase'} onClick={() => setActiveTool('erase')} />
+              <RibbonButton
+                icon={ShieldCheck}
+                label={pendingRedactions > 0 ? `Apply (${pendingRedactions})` : 'Apply'}
+                large
+                disabled={!doc || pendingRedactions === 0}
+                onClick={() => doc && applyRedactions(doc.id)}
+              />
+              <RibbonButton icon={Trash2} label="Delete Page" large disabled={!doc} onClick={() => doc && deletePage(doc.id, currentPage - 1)} />
+            </RibbonGroup>
             <RibbonGroup title="Find">
               <div className="flex items-center gap-1">
                 <input
@@ -819,8 +822,8 @@ export default function Ribbon() {
               </div>
             )}
             <div className="flex max-w-[260px] items-center px-2 text-[10px] leading-snug text-muted">
-              Easy keeps photos print-sharp (200 dpi), Medium suits screens and email (144 dpi), Hard is
-              smallest (96 dpi). Text always stays sharp and selectable.
+              Easy keeps photos print-sharp (220 dpi), Medium suits sharing and email (190 dpi), Hard is
+              smallest while photos stay clear (165 dpi). Text always stays sharp and selectable.
             </div>
             {convertError && (
               <div className="flex items-center px-4 text-[11px] text-signal-danger">
@@ -1226,9 +1229,8 @@ export default function Ribbon() {
                 // fall back to the existing filename-only flow, which
                 // still saves to the browser's normal Downloads location
                 setShowSaveAsModal(true);
-              } else if (result === 'saved') {
-                showToast('The file has been successfully saved to the chosen location.');
               }
+              // 'saved' — the store shows the confirmation
               // 'cancelled' — user closed the dialog, do nothing further
             });
           }}
@@ -1240,7 +1242,7 @@ export default function Ribbon() {
           onShare={handleShare}
           onEmail={handleEmail}
           onCloseDocument={() => {
-            if (doc) closeDocument(doc.id);
+            if (doc) requestCloseDocument(doc.id);
             setShowBackstage(false);
           }}
           onSwitchDocument={(id) => setActiveDocument(id)}

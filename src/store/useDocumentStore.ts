@@ -408,30 +408,44 @@ function multiplyMatrix(m1: number[], m2: number[]): number[] {
 // two orderings diverge could mis-attribute a color to a neighboring
 // item — acceptable for "detect and reuse the existing color when
 // editing," not something to rely on for exact reproduction.
-async function extractFillColorsInOrder(
-  page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>
-): Promise<string[]> {
-  const colors: string[] = [];
+//
+// Two things made the old version pick wrong colours on real files: it
+// ignored q/Q (save/restore), so a shape filled inside q…Q leaked its colour
+// onto the text drawn after it; and it paired colours with text items by
+// count, but pdf.js splits one TJ with a wide gap into several items (and
+// merges others), so every later line shifted onto its neighbour's colour.
+// Colours are now recorded per drawn character and matched to the text
+// items by their characters, which survives any split or merge.
+const normalizeForMatch = (s: string) => s.normalize('NFKC').replace(/\s+/g, '');
+
+async function extractItemColors<T extends { str: string }>(
+  page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>,
+  items: T[]
+): Promise<Map<T, string>> {
+  const result = new Map<T, string>();
+  const chars: string[] = [];
+  const charColors: string[] = [];
   try {
     const opList = await page.getOperatorList();
     const OPS = pdfjsLib.OPS;
     let fillColor = '#000000';
+    const stack: string[] = [];
 
     for (let i = 0; i < opList.fnArray.length; i++) {
       const fn = opList.fnArray[i];
       const args = opList.argsArray[i] as unknown[];
-      if (
+      if (fn === OPS.save || fn === OPS.paintFormXObjectBegin) {
+        stack.push(fillColor);
+      } else if (fn === OPS.restore || fn === OPS.paintFormXObjectEnd) {
+        if (stack.length) fillColor = stack.pop()!;
+      } else if (
         fn === OPS.setFillRGBColor ||
         fn === OPS.setFillGray ||
         fn === OPS.setFillCMYKColor ||
         fn === OPS.setFillColor
       ) {
-        // pdf.js's operator list already pre-formats every fill-color op
-        // into a ready CSS hex string in args[0] (verified directly
-        // against pdf.js's actual output, not assumed) — a Pattern or
-        // Separation colorspace is the one case that won't produce a
-        // parseable hex string here, in which case the previous color is
-        // simply kept rather than guessing.
+        // pdf.js pre-formats fill colours as a CSS hex string; a Pattern
+        // or Separation colour space doesn't, and keeps the previous colour
         if (typeof args?.[0] === 'string' && args[0].startsWith('#')) {
           fillColor = args[0];
         }
@@ -441,18 +455,69 @@ async function extractFillColorsInOrder(
         fn === OPS.nextLineShowText ||
         fn === OPS.nextLineSetSpacingShowText
       ) {
-        colors.push(fillColor);
+        const glyphs = (args ?? []).find((a) => Array.isArray(a)) as unknown[] | undefined;
+        for (const g of glyphs ?? []) {
+          const u = (g as { unicode?: unknown } | null)?.unicode;
+          if (typeof u !== 'string') continue; // spacing numbers in a TJ
+          for (const ch of normalizeForMatch(u)) {
+            chars.push(ch);
+            charColors.push(fillColor);
+          }
+        }
       }
     }
   } catch {
-    // if this fails for any reason, every line just falls back to black
+    return result; // every line falls back to black
   }
-  return colors;
+
+  let p = 0;
+  for (const item of items) {
+    const want = [...normalizeForMatch(item.str)];
+    if (want.length === 0) continue;
+    // find where this item's text was drawn — normally right at p, but
+    // look ahead in case something in between wasn't in the text layer
+    const probe = Math.min(want.length, 6);
+    let start = -1;
+    for (let k = p; k < Math.min(chars.length, p + 4000); k++) {
+      let ok = true;
+      for (let j = 0; j < probe; j++) {
+        if (chars[k + j] !== want[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        start = k;
+        break;
+      }
+    }
+    if (start < 0) {
+      result.set(item, charColors[Math.min(p, charColors.length - 1)] ?? '#000000');
+      continue;
+    }
+    const counts = new Map<string, number>();
+    let k = start;
+    for (const ch of want) {
+      if (chars[k] !== ch) break;
+      counts.set(charColors[k], (counts.get(charColors[k]) ?? 0) + 1);
+      k++;
+    }
+    p = k;
+    let best = '#000000';
+    let bestCount = 0;
+    for (const [c, n] of counts) {
+      if (n > bestCount) {
+        best = c;
+        bestCount = n;
+      }
+    }
+    result.set(item, best);
+  }
+  return result;
 }
 
 async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPage']>>): Promise<TextLine[]> {
   const textContent = await page.getTextContent();
-  const colorSamples = await extractFillColorsInOrder(page);
   type Item = { str: string; transform: number[]; width: number; height: number; fontName?: string };
   const styles = (textContent.styles ?? {}) as Record<string, { fontFamily?: string }>;
 
@@ -533,16 +598,7 @@ async function extractTextLines(page: Awaited<ReturnType<PDFDocumentProxy['getPa
   }
 
   const items = (textContent.items as Item[]).filter((it) => it.str !== undefined);
-  const itemColor = new Map<Item, string>();
-  // pdf.js's getTextContent() inserts synthetic empty-string "end of line"
-  // marker items that don't correspond to an actual showText call in the
-  // operator list — verified directly (a 4-line, 4-color test produced 5
-  // items, with the extra one being an empty hasEOL marker). Excluding
-  // those before zipping against colorSamples is what keeps the two
-  // sequences aligned; without it, every color after the first line ends
-  // up shifted onto the wrong text.
-  const drawableItems = items.filter((it) => it.str !== '');
-  drawableItems.forEach((it, i) => itemColor.set(it, colorSamples[i] ?? '#000000'));
+  const itemColor = await extractItemColors(page, items);
 
   // Group into lines by baseline proximity AND horizontal proximity.
   //
@@ -1272,6 +1328,9 @@ interface HistoryEntry {
   pdfSnapshot?: { docId: string; bytes: Uint8Array };
 }
 
+export type ToastKind = 'success' | 'error' | 'busy';
+let toastSeq = 0;
+
 interface DocumentState {
   documents: OpenDocument[];
   activeId: string | null;
@@ -1293,8 +1352,8 @@ interface DocumentState {
   setPendingCrop: (
     crop: { docId: string; page: number; x: number; y: number; w: number; h: number } | null
   ) => void;
-  toast: { message: string; kind: 'success' | 'error' } | null;
-  showToast: (message: string, kind?: 'success' | 'error') => void;
+  toast: { id: number; message: string; kind: ToastKind } | null;
+  showToast: (message: string, kind?: ToastKind) => void;
   dismissToast: () => void;
   // whichever text box is currently open for editing on the canvas, if
   // any — lets ribbon controls (font family/size/bold/italic/underline)
@@ -1340,6 +1399,16 @@ interface DocumentState {
 
   openFile: (file: File) => Promise<void>;
   closeDocument: (id: string) => void;
+  // documents with edits that haven't been saved yet (kept up to date by a
+  // store subscription at the bottom of this file)
+  unsavedDocs: Record<string, true>;
+  markSaved: (id: string) => void;
+  markUnsaved: (id: string) => void;
+  // closing something with unsaved edits asks first: a single tab, or the
+  // whole app window
+  closeRequest: { kind: 'doc'; docId: string } | { kind: 'app' } | null;
+  requestCloseDocument: (id: string) => void;
+  setCloseRequest: (r: DocumentState['closeRequest']) => void;
   setActiveDocument: (id: string) => void;
   setCurrentPage: (page: number) => void;
   setZoom: (zoom: number) => void;
@@ -1377,7 +1446,7 @@ interface DocumentState {
   mergeSelectedFiles: (
     files: File[]
   ) => Promise<{ ok: true; skipped: string[] } | { ok: false; error: string }>;
-  exportDocument: (docId: string) => Promise<void>;
+  exportDocument: (docId: string) => Promise<boolean>;
   buildExportBytes: (docId: string) => Promise<Uint8Array | null>;
 
   // annotations
@@ -1543,14 +1612,22 @@ async function bytesToProxy(bytes: Uint8Array): Promise<PDFDocumentProxy> {
   return task.promise;
 }
 
-function downloadBlob(bytes: Uint8Array, filename: string) {
-  const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
+// Every file the app writes goes through here, so every save, conversion,
+// split, merge and compression ends with the same visible confirmation.
+// `action` is the first words of that notification; pass null when the
+// caller shows its own, more specific one (e.g. compression sizes).
+function downloadBlob(data: Uint8Array | Blob, filename: string, action: string | null = 'Saved') {
+  const blob = data instanceof Blob ? data : new Blob([data as BlobPart], { type: 'application/pdf' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
   a.click();
-  URL.revokeObjectURL(url);
+  // revoking straight away can cancel the download in some engines
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  if (action) {
+    useDocumentStore.getState().showToast(`${action} — “${filename}” saved to your Downloads folder.`);
+  }
 }
 
 export const useDocumentStore = create<DocumentState>((set, get) => ({
@@ -1587,6 +1664,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   pageObstacles: {},
   lineEdits: {},
   lineStyleOverrides: {},
+  unsavedDocs: {},
+  closeRequest: null,
   activeEditLine: null,
 
   openFile: async (file: File) => {
@@ -1678,7 +1757,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     // with the correct password); saving it now, without calling .encrypt(),
     // produces a completely unencrypted copy.
     const bytes = await doc.pdfLibDoc.save();
-    downloadBlob(bytes, `unlocked-${doc.name}`);
+    downloadBlob(bytes, `unlocked-${doc.name}`, 'Password removed');
   },
 
   // Real cryptographic PKCS#12 digital signature: builds a CMS/PKCS#7
@@ -1718,7 +1797,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       });
       const signedBytes: Buffer = await signpdf.sign(pdfWithPlaceholder, signer);
 
-      downloadBlob(new Uint8Array(signedBytes), `signed-${doc.name}`);
+      downloadBlob(new Uint8Array(signedBytes), `signed-${doc.name}`, 'Digitally signed');
       return { ok: true };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -1757,7 +1836,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       }
       const outBytes = new Uint8Array(await res.arrayBuffer());
       const baseName = doc.name.replace(/\.pdf$/i, '');
-      downloadBlob(outBytes, `${baseName}.${target}`);
+      downloadBlob(outBytes, `${baseName}.${target}`, `Converted to ${target.toUpperCase()}`);
       return { ok: true };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -1948,7 +2027,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const exportDoc = await PDFDocument.load(bytes);
     exportDoc.getForm().flatten();
     const outBytes = await exportDoc.save();
-    downloadBlob(outBytes, `filled-${doc.name}`);
+    downloadBlob(outBytes, `filled-${doc.name}`, 'Form flattened');
   },
 
   // ---------- File tab ----------
@@ -1986,6 +2065,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     set((s) => ({
       documents: s.documents.map((d) => (d.id === docId ? { ...d, name: finalName } : d)),
     }));
+    get().markSaved(docId);
   },
 
   // Real destination-folder picker via the File System Access API — a
@@ -2038,6 +2118,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     set((s) => ({
       documents: s.documents.map((d) => (d.id === docId ? { ...d, name: handle.name } : d)),
     }));
+    get().markSaved(docId);
+    get().showToast(`Saved — “${handle.name}” written to the folder you chose.`);
     return 'saved';
   },
 
@@ -2067,6 +2149,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     doc.pdfLibDoc.setSubject(meta.subject);
     doc.pdfLibDoc.setKeywords(meta.keywords ? meta.keywords.split(',').map((k) => k.trim()) : []);
     doc.pdfLibDoc.setModificationDate(new Date());
+    get().markUnsaved(docId);
   },
 
   getPrintUrl: async (docId) => {
@@ -2105,7 +2188,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       currentPage: 1,
       annotations: { ...s.annotations, [doc.id]: {} },
     }));
-    downloadBlob(outBytes, newName);
+    downloadBlob(outBytes, newName, 'Converted to PDF');
   },
 
   createPdfFromImages: async (files) => {
@@ -2139,7 +2222,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       currentPage: 1,
       annotations: { ...s.annotations, [doc.id]: {} },
     }));
-    downloadBlob(outBytes, newName);
+    downloadBlob(outBytes, newName, 'Converted to PDF');
   },
 
   // Real image recompression, not a gimmick: most oversized PDFs are large
@@ -2314,7 +2397,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       // an in-app tab, never written to disk — despite the success message
       // implying it had been saved. Downloading it here is what makes that
       // message true, and matches how the PDF -> Word/PNG direction already behaves.
-      downloadBlob(outBytes, newName);
+      downloadBlob(outBytes, newName, 'Converted to PDF');
       return { ok: true };
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -2363,7 +2446,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       if (outBytes.length >= originalSize * 0.98) {
         return { originalSize, compressedSize: originalSize, savedPct: 0, saved: false, fontBytesSaved, ...stats };
       }
-      downloadBlob(outBytes, `compressed-${level}-${doc.name}`);
+      downloadBlob(outBytes, `compressed-${level}-${doc.name}`, null); // Ribbon shows the sizes
       const savedPct = Math.round((1 - outBytes.length / originalSize) * 100);
       return { originalSize, compressedSize: outBytes.length, savedPct, saved: true, fontBytesSaved, ...stats };
     } catch (e) {
@@ -2405,17 +2488,33 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   setPendingCrop: (crop) => set({ pendingCrop: crop }),
 
   showToast: (message, kind = 'success') => {
-    set({ toast: { message, kind } });
-    // auto-dismiss after a few seconds — errors stay a bit longer since
-    // they usually need actual reading, not just a glance
-    const duration = kind === 'error' ? 6000 : 3500;
+    const id = ++toastSeq;
+    set({ toast: { id, message, kind } });
+    // a busy toast stays until the next one replaces it; others fade on
+    // their own — errors stay longer since they need actually reading
+    if (kind === 'busy') return;
+    const duration = kind === 'error' ? 8000 : 5000;
     setTimeout(() => {
       // only clear if this is still the same toast (a newer one hasn't replaced it)
-      set((s) => (s.toast?.message === message ? { toast: null } : {}));
+      set((s) => (s.toast?.id === id ? { toast: null } : {}));
     }, duration);
   },
 
   dismissToast: () => set({ toast: null }),
+
+  markSaved: (id) =>
+    set((s) => {
+      if (!s.unsavedDocs[id]) return {};
+      const next = { ...s.unsavedDocs };
+      delete next[id];
+      return { unsavedDocs: next };
+    }),
+  markUnsaved: (id) => set((s) => (s.unsavedDocs[id] ? {} : { unsavedDocs: { ...s.unsavedDocs, [id]: true } })),
+  requestCloseDocument: (id) => {
+    if (get().unsavedDocs[id]) set({ closeRequest: { kind: 'doc', docId: id } });
+    else get().closeDocument(id);
+  },
+  setCloseRequest: (r) => set({ closeRequest: r }),
 
   // Real PDF cropping via the standard CropBox concept (not a rasterize
   // trick) — content outside the crop rectangle is still technically in
@@ -2593,7 +2692,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const copied = await newDoc.copyPages(doc.pdfLibDoc, indices);
     copied.forEach((p) => newDoc.addPage(p));
     const bytes = await newDoc.save();
-    downloadBlob(bytes, `extracted-${range[0]}-${range[range.length - 1]}-${doc.name}`);
+    downloadBlob(bytes, `extracted-${range[0]}-${range[range.length - 1]}-${doc.name}`, range.length === 1 ? 'Page extracted' : 'Pages extracted');
   },
 
   splitDocument: async (docId, mode, options) => {
@@ -2660,7 +2759,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       const copied = await newDoc.copyPages(doc.pdfLibDoc, groups[0].map((p) => p - 1));
       copied.forEach((p) => newDoc.addPage(p));
       const bytes = await newDoc.save();
-      downloadBlob(bytes, `${baseName}-p${groups[0][0]}-${groups[0][groups[0].length - 1]}.pdf`);
+      downloadBlob(bytes, `${baseName}-p${groups[0][0]}-${groups[0][groups[0].length - 1]}.pdf`, 'Split');
       return { ok: true, fileCount: 1 };
     }
 
@@ -2676,12 +2775,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       zip.file(`${baseName}-${String(i + 1).padStart(padWidth, '0')}-${label}.pdf`, bytes);
     }
     const zipBlob = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(zipBlob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${baseName}-split.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(zipBlob, `${baseName}-split.zip`, `Split into ${groups.length} files`);
     return { ok: true, fileCount: groups.length };
   },
 
@@ -2774,16 +2868,27 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       currentPage: 1,
       annotations: { ...s.annotations, [merged.id]: {} },
     }));
-    downloadBlob(bytes, 'Merged.pdf');
+    downloadBlob(bytes, 'Merged.pdf', 'Merged');
     return { ok: true, skipped };
   },
 
   exportDocument: async (docId) => {
     const doc = get().documents.find((d) => d.id === docId);
-    if (!doc) return;
-    const outBytes = await get().buildExportBytes(docId);
-    if (!outBytes) return;
-    downloadBlob(outBytes, doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`);
+    if (!doc) return false;
+    get().showToast('Saving…', 'busy');
+    try {
+      const outBytes = await get().buildExportBytes(docId);
+      if (!outBytes) {
+        get().dismissToast();
+        return false;
+      }
+      downloadBlob(outBytes, doc.name.endsWith('.pdf') ? doc.name : `${doc.name}.pdf`);
+      get().markSaved(docId);
+      return true;
+    } catch (e) {
+      get().showToast(`Couldn’t save: ${e instanceof Error ? e.message : String(e)}`, 'error');
+      return false;
+    }
   },
 
   // The real, full export: clones the document, embeds every font actually
@@ -3146,12 +3251,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     });
 
     const blob = await Packer.toBlob(wordDoc);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${doc.name.replace(/\.pdf$/i, '')}.docx`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, `${doc.name.replace(/\.pdf$/i, '')}.docx`, 'Converted to Word');
   },
 
   exportToPng: async (docId) => {
@@ -3174,13 +3274,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
 
     if (doc.pageCount === 1) {
       const bytes = await renderPageToPngBytes(1);
-      const blob = new Blob([bytes as BlobPart], { type: 'image/png' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${baseName}.png`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(new Blob([bytes as BlobPart], { type: 'image/png' }), `${baseName}.png`, 'Converted to PNG');
       return;
     }
 
@@ -3190,12 +3284,7 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       zip.file(`${baseName}-page-${String(p).padStart(3, '0')}.png`, bytes);
     }
     const zipBlob = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(zipBlob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${baseName}-pages.zip`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(zipBlob, `${baseName}-pages.zip`, `Converted ${doc.pageCount} pages to PNG`);
   },
 
   addImageAnnotation: async (docId, file) => {
@@ -3667,7 +3756,8 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const bytes = await exportDoc.save();
     downloadBlob(
       bytes,
-      doc.name.endsWith('.pdf') ? `protected-${doc.name}` : `protected-${doc.name}.pdf`
+      doc.name.endsWith('.pdf') ? `protected-${doc.name}` : `protected-${doc.name}.pdf`,
+      'Password protected'
     );
   },
 
@@ -3855,7 +3945,10 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
   },
 
   setLineEdit: (docId, page, lineIndex, text) => {
-    const { annotations, lineEdits, lineStyleOverrides, undoStack } = get();
+    const { annotations, lineEdits, lineStyleOverrides, undoStack, pageLines } = get();
+    const original = pageLines[docId]?.[page]?.find((l) => l.index === lineIndex)?.text;
+    if (lineEdits[docId]?.[page]?.[lineIndex] === undefined && text === original) return;
+    if (lineEdits[docId]?.[page]?.[lineIndex] === text) return;
     set({ undoStack: [...undoStack, { annotations, lineEdits, lineStyleOverrides }], redoStack: [] });
     const docEdits = { ...(lineEdits[docId] ?? {}) };
     docEdits[page] = { ...(docEdits[page] ?? {}), [lineIndex]: text };
@@ -3977,3 +4070,42 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     });
   },
 }));
+
+// Unsaved-changes tracking. Rather than every action remembering to flag
+// its document, this watches the per-document slices that hold edits and
+// flags a document whenever one of them changes: annotations, edited or
+// restyled lines, filled form values, or the PDF itself (pages rotated,
+// deleted, cropped, edits applied…). A rename alone doesn't count, and
+// state that's merely loaded for the first time (prev undefined) doesn't
+// either. Saving clears the flag via markSaved.
+const formValuesSig = (fields: DetectedFormField[] | undefined) =>
+  fields ? fields.map((f) => `${f.id}=${f.value}`).join('') : undefined;
+
+useDocumentStore.subscribe((s, prev) => {
+  const changed: string[] = [];
+  for (const d of s.documents) {
+    const before = prev.documents.find((p) => p.id === d.id);
+    if (!before) continue; // just opened or created
+    if (s.unsavedDocs[d.id]) continue;
+    const id = d.id;
+    if (
+      before.pdfLibDoc !== d.pdfLibDoc ||
+      before.proxy !== d.proxy ||
+      (prev.annotations[id] !== undefined && prev.annotations[id] !== s.annotations[id]) ||
+      prev.lineEdits[id] !== s.lineEdits[id] ||
+      prev.lineStyleOverrides[id] !== s.lineStyleOverrides[id] ||
+      (prev.formFields[id] !== undefined &&
+        prev.formFields[id] !== s.formFields[id] &&
+        formValuesSig(prev.formFields[id]) !== formValuesSig(s.formFields[id]))
+    ) {
+      changed.push(id);
+    }
+  }
+  // forget documents that were closed
+  const gone = Object.keys(s.unsavedDocs).filter((id) => !s.documents.some((d) => d.id === id));
+  if (changed.length === 0 && gone.length === 0) return;
+  const next = { ...s.unsavedDocs };
+  for (const id of changed) next[id] = true;
+  for (const id of gone) delete next[id];
+  useDocumentStore.setState({ unsavedDocs: next });
+});
