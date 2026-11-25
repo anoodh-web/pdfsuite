@@ -58,6 +58,7 @@ import {
   Printer,
   Mail,
   Smartphone,
+  SquareScissors,
 } from 'lucide-react';
 import { useDocumentStore, type CompressResult } from '../store/useDocumentStore';
 import DigitalSignatureModal from './DigitalSignatureModal';
@@ -576,6 +577,9 @@ export default function Ribbon() {
               <RibbonButton icon={Hand} label="Hand" active={activeTool === 'hand'} onClick={() => setActiveTool('hand')} />
               <RibbonButton icon={MousePointer2} label="Select" active={activeTool === 'select'} onClick={() => setActiveTool('select')} />
             </RibbonGroup>
+            <RibbonGroup title="Snip">
+              <RibbonButton icon={SquareScissors} label="Snip" large active={activeTool === 'snip'} disabled={!doc} onClick={() => setActiveTool('snip')} />
+            </RibbonGroup>
             <RibbonGroup title="Document">
               <RibbonButton icon={FilePlus2} label="Open" large onClick={() => fileInputRef.current?.click()} />
               <RibbonButton icon={Layers} label="Combine" large disabled={documents.length < 2} onClick={mergeAllOpenDocuments} />
@@ -747,6 +751,7 @@ export default function Ribbon() {
               <RibbonButton icon={PenLine} label="Ink" large active={activeTool === 'ink'} onClick={() => setActiveTool('ink')} />
               <RibbonButton icon={Check} label="Tick" large active={activeTool === 'stamp-tick'} onClick={() => setActiveTool('stamp-tick')} />
               <RibbonButton icon={Circle} label="Dot" large active={activeTool === 'stamp-dot'} onClick={() => setActiveTool('stamp-dot')} />
+              <RibbonButton icon={SquareScissors} label="Snip" large active={activeTool === 'snip'} disabled={!doc} onClick={() => setActiveTool('snip')} />
               <RibbonButton icon={MousePointer2} label="Select" large active={activeTool === 'select'} onClick={() => setActiveTool('select')} />
             </RibbonGroup>
             <RibbonGroup title="Edit & Erase">

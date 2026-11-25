@@ -1455,6 +1455,7 @@ interface DocumentState {
   updateTextBoxText: (docId: string, page: number, id: string, text: string) => void;
   updateTextBoxPosition: (docId: string, page: number, id: string, x: number, y: number) => void;
   updateImagePosition: (docId: string, page: number, id: string, x: number, y: number) => void;
+  updateImageSize: (docId: string, page: number, id: string, w: number, h: number) => void;
   updateNotePosition: (docId: string, page: number, id: string, x: number, y: number) => void;
   finalizeSignature: (
     docId: string,
@@ -1470,7 +1471,15 @@ interface DocumentState {
   redo: () => Promise<void>;
   exportToWord: (docId: string) => Promise<void>;
   exportToPng: (docId: string) => Promise<void>;
-  addImageAnnotation: (docId: string, file: File) => Promise<void>;
+  // `widthFor` picks the image's width as a fraction of the page width from
+  // its pixel size (used when pasting, so a snip comes back at its real size);
+  // without it the image is placed at 28% of the page width. Returns the new
+  // annotation's id.
+  addImageAnnotation: (
+    docId: string,
+    file: File,
+    widthFor?: (pxW: number, pxH: number) => number
+  ) => Promise<string | undefined>;
   runOcrOnPage: (docId: string, pageNum: number) => Promise<void>;
   runOcrOnDocument: (docId: string) => Promise<void>;
   applyRedactions: (docId: string) => Promise<void>;
@@ -1616,7 +1625,7 @@ async function bytesToProxy(bytes: Uint8Array): Promise<PDFDocumentProxy> {
 // split, merge and compression ends with the same visible confirmation.
 // `action` is the first words of that notification; pass null when the
 // caller shows its own, more specific one (e.g. compression sizes).
-function downloadBlob(data: Uint8Array | Blob, filename: string, action: string | null = 'Saved') {
+export function downloadBlob(data: Uint8Array | Blob, filename: string, action: string | null = 'Saved') {
   const blob = data instanceof Blob ? data : new Blob([data as BlobPart], { type: 'application/pdf' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -3287,9 +3296,9 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     downloadBlob(zipBlob, `${baseName}-pages.zip`, `Converted ${doc.pageCount} pages to PNG`);
   },
 
-  addImageAnnotation: async (docId, file) => {
+  addImageAnnotation: async (docId, file, widthFor) => {
     const doc = get().documents.find((d) => d.id === docId);
-    if (!doc) return;
+    if (!doc) return undefined;
     const dataUrl: string = await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(reader.result as string);
@@ -3302,20 +3311,31 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
       img.onload = () => resolve({ w: img.width, h: img.height });
       img.src = dataUrl;
     });
-    const defaultW = 0.28; // 28% of page width
-    const defaultH = defaultW * (dims.h / dims.w);
+    // w is a fraction of the page's width and h of its height, so the page's
+    // own shape has to be factored in or the image comes out stretched
+    const pageVp = (await doc.proxy.getPage(get().currentPage)).getViewport({ scale: 1 });
+    const pageAspect = pageVp.width / pageVp.height;
+    let w = Math.min(0.95, Math.max(0.02, widthFor ? widthFor(dims.w, dims.h) : 0.28));
+    let h = w * (dims.h / dims.w) * pageAspect;
+    if (h > 0.95) {
+      w *= 0.95 / h;
+      h = 0.95;
+    }
+    const id = `${Date.now()}`;
 
     get().addAnnotation(docId, {
-      id: `${Date.now()}`,
+      id,
       type: 'image',
       page: get().currentPage,
       color: '#000000',
-      x: 0.36,
-      y: 0.4,
-      w: defaultW,
-      h: defaultH,
+      // centred, nudged up a little; kept on the page if it's tall
+      x: (1 - w) / 2,
+      y: Math.max(0.02, Math.min(0.4, (1 - h) / 2)),
+      w,
+      h,
       dataUrl,
     });
+    return id;
   },
 
   runOcrOnPage: async (docId, pageNum) => {
@@ -3803,6 +3823,15 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     const docAnns = { ...(annotations[docId] ?? {}) };
     docAnns[page] = (docAnns[page] ?? []).map((a) =>
       a.id === id && a.type === 'image' ? { ...a, x, y } : a
+    );
+    set({ annotations: { ...annotations, [docId]: docAnns } });
+  },
+
+  updateImageSize: (docId, page, id, w, h) => {
+    const { annotations } = get();
+    const docAnns = { ...(annotations[docId] ?? {}) };
+    docAnns[page] = (docAnns[page] ?? []).map((a) =>
+      a.id === id && a.type === 'image' ? { ...a, w, h } : a
     );
     set({ annotations: { ...annotations, [docId]: docAnns } });
   },

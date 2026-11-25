@@ -4,6 +4,8 @@ import {
   AlignLeft,
   AlignRight,
   Bold as BoldIcon,
+  Copy,
+  Download,
   FilePlus2,
   FileWarning,
   Italic as ItalicIcon,
@@ -24,10 +26,15 @@ import {
   type Annotation,
   type CachedLine,
   type LineAlign,
+  downloadBlob,
 } from '../store/useDocumentStore';
+import { renderSnip, copySnip, pastedImageWidth, type SnipRect } from '../store/snip';
 import type { WrapContext } from '../store/lineLayout';
 import SignaturePad from './SignaturePad';
 import { FONT_FAMILY_CSS } from './FontFamilyDropdown';
+
+// Tools used by dragging out a rectangle on the page
+const RECT_TOOLS = new Set(['highlight', 'fill', 'redact', 'erase', 'crop', 'snip']);
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
@@ -144,6 +151,10 @@ export default function Canvas() {
     updateTextBoxText,
     updateTextBoxPosition,
     updateImagePosition,
+    updateImageSize,
+    setActiveTool,
+    addImageAnnotation,
+    showToast,
     updateNotePosition,
     finalizeSignature,
     deleteAnnotation,
@@ -177,6 +188,10 @@ export default function Canvas() {
   const [openTextId, setOpenTextId] = useState<string | null>(null);
   const [openSignatureId, setOpenSignatureId] = useState<string | null>(null);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  // The area last cut with the Snip tool, kept on screen with its actions
+  // until another snip, Esc, or leaving the page.
+  const [snip, setSnip] = useState<(SnipRect & { docId: string; page: number }) | null>(null);
+  const snipBlobRef = useRef<Promise<Blob> | null>(null);
 
   const doc = documents.find((d) => d.id === activeId);
   const pageAnnotations: Annotation[] = doc
@@ -571,6 +586,61 @@ export default function Canvas() {
     return () => window.removeEventListener('keydown', handler);
   }, [activeTool, doc, currentPage, addAnnotation, applyRedactions]);
 
+  // A snip belongs to one page: drop it when leaving that page or document.
+  useEffect(() => {
+    setSnip((cur) => (cur && (cur.docId !== doc?.id || cur.page !== currentPage) ? null : cur));
+  }, [doc?.id, currentPage]);
+
+  useEffect(() => {
+    if (!snip) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSnip(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [snip]);
+
+  // Ctrl+V with a picture on the clipboard (a snip from here, a Win+Shift+S
+  // screenshot, an image copied from a browser...) places it on the page.
+  useEffect(() => {
+    if (!doc) return;
+    const onPaste = async (e: ClipboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const file = Array.from(e.clipboardData?.files ?? []).find((f) => /^image\/(png|jpe?g)$/.test(f.type));
+      if (!file) return;
+      e.preventDefault();
+      const pageWidthPt = pageSize.w / (zoom * 1.4);
+      const id = await addImageAnnotation(doc.id, file, (pxW, pxH) =>
+        pageWidthPt ? pastedImageWidth(pxW, pxH, pageWidthPt) : 0.28
+      );
+      if (!id) return;
+      // centre it in the part of the page that's on screen, not the page's
+      // middle, which may be scrolled out of view
+      const overlay = overlayRef.current;
+      const scroller = overlay?.closest('.pdfsuite-canvas-scroll');
+      const added = useDocumentStore
+        .getState()
+        .annotations[doc.id]?.[currentPage]?.find((a) => a.id === id);
+      if (overlay && scroller && added?.type === 'image') {
+        const o = overlay.getBoundingClientRect();
+        const v = scroller.getBoundingClientRect();
+        const top = Math.max(o.top, v.top);
+        const bottom = Math.min(o.bottom, v.bottom);
+        if (bottom > top) {
+          const cy = ((top + bottom) / 2 - o.top) / o.height;
+          const y = Math.max(0, Math.min(1 - added.h, cy - added.h / 2));
+          updateImagePosition(doc.id, currentPage, id, added.x, y);
+        }
+      }
+      setActiveTool('select');
+      setSelectedAnnotationId(id);
+      showToast('Picture added — drag it to move, or drag its corner to resize.');
+    };
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [doc, currentPage, pageSize.w, zoom, addImageAnnotation, updateImagePosition, setActiveTool, showToast]);
+
   const relPos = useCallback((e: React.MouseEvent) => {
     const rect = overlayRef.current!.getBoundingClientRect();
     return {
@@ -595,7 +665,8 @@ export default function Canvas() {
     ) {
       e.preventDefault();
     }
-    if (activeTool === 'highlight' || activeTool === 'fill' || activeTool === 'redact' || activeTool === 'erase' || activeTool === 'crop') {
+    if (RECT_TOOLS.has(activeTool ?? '')) {
+      if (activeTool === 'snip') setSnip(null);
       setDrag(pos);
       setDragNow(pos);
     } else if (activeTool === 'ink') {
@@ -691,7 +762,7 @@ export default function Canvas() {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if ((activeTool === 'highlight' || activeTool === 'fill' || activeTool === 'redact' || activeTool === 'erase' || activeTool === 'crop') && drag) {
+    if (RECT_TOOLS.has(activeTool ?? '') && drag) {
       setDragNow(relPos(e));
     } else if (activeTool === 'ink' && inkPoints.length > 0) {
       setInkPoints((pts) => [...pts, relPos(e)]);
@@ -700,13 +771,20 @@ export default function Canvas() {
 
   const handleMouseUp = () => {
     if (!doc) return;
-    if ((activeTool === 'highlight' || activeTool === 'fill' || activeTool === 'redact' || activeTool === 'erase' || activeTool === 'crop') && drag && dragNow) {
+    if (RECT_TOOLS.has(activeTool ?? '') && drag && dragNow) {
       const x = Math.min(drag.x, dragNow.x);
       const y = Math.min(drag.y, dragNow.y);
       const w = Math.abs(dragNow.x - drag.x);
       const h = Math.abs(dragNow.y - drag.y);
       if (w > 0.005 && h > 0.005) {
-        if (activeTool === 'crop') {
+        if (activeTool === 'snip') {
+          const rect = { docId: doc.id, page: currentPage, x, y, w, h };
+          setSnip(rect);
+          const blob = renderSnip(doc.proxy, currentPage, rect);
+          snipBlobRef.current = blob;
+          blob.catch(() => {});
+          copySnipToClipboard(blob);
+        } else if (activeTool === 'crop') {
           setPendingCrop({ docId: doc.id, page: currentPage, x, y, w, h });
         } else if (activeTool === 'redact' || activeTool === 'erase') {
           addAnnotation(doc.id, {
@@ -757,6 +835,25 @@ export default function Canvas() {
     }
   };
 
+  const copySnipToClipboard = (blob: Promise<Blob>) => {
+    copySnip(blob)
+      .then(() =>
+        showToast('Snip copied — paste it into any app, or press Ctrl+V on a page to add it to a PDF.')
+      )
+      .catch(() => showToast('Couldn’t copy the snip — use Save PNG to keep it as a picture instead.', 'error'));
+  };
+
+  const saveSnip = async () => {
+    if (!snip || !snipBlobRef.current || !doc) return;
+    try {
+      const blob = await snipBlobRef.current;
+      const base = doc.name.replace(/\.pdf$/i, '');
+      downloadBlob(blob, `${base} - page ${snip.page} snip.png`, 'Snip saved');
+    } catch {
+      showToast('Couldn’t create the snip picture.', 'error');
+    }
+  };
+
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     const file = e.dataTransfer.files?.[0];
@@ -795,7 +892,7 @@ export default function Canvas() {
   }
 
   const cursorClass =
-    activeTool === 'highlight' || activeTool === 'fill' || activeTool === 'ink' || activeTool === 'redact' || activeTool === 'erase' || activeTool === 'crop'
+    RECT_TOOLS.has(activeTool ?? '') || activeTool === 'ink'
       ? 'cursor-crosshair'
       : activeTool === 'edit-text'
       ? 'cursor-text'
@@ -939,7 +1036,7 @@ export default function Canvas() {
                     />
                   </g>
                 ))}
-              {drag && dragNow && activeTool !== 'crop' && (
+              {drag && dragNow && activeTool !== 'crop' && activeTool !== 'snip' && (
                 <rect
                   x={`${Math.min(drag.x, dragNow.x) * 100}%`}
                   y={`${Math.min(drag.y, dragNow.y) * 100}%`}
@@ -973,6 +1070,52 @@ export default function Canvas() {
                 it's clear what will be kept, with a dashed accent border
                 around the kept area — shown both while dragging and after
                 release (until Apply/Cancel in the Page Layout tab). */}
+            {activeTool === 'snip' && drag && dragNow && (
+              <CropMarquee
+                x={Math.min(drag.x, dragNow.x)}
+                y={Math.min(drag.y, dragNow.y)}
+                w={Math.abs(dragNow.x - drag.x)}
+                h={Math.abs(dragNow.y - drag.y)}
+              />
+            )}
+            {!drag && snip && snip.docId === doc.id && snip.page === currentPage && (
+              <>
+                <CropMarquee x={snip.x} y={snip.y} w={snip.w} h={snip.h} />
+                <div
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="pointer-events-auto absolute z-30 flex items-center gap-1 rounded-md border border-ink-500 bg-ink-800 p-1 shadow-xl"
+                  style={{
+                    left: `${snip.x * 100}%`,
+                    // below the snip, or above it when it reaches the page bottom
+                    ...(snip.y + snip.h > 0.9
+                      ? { bottom: `${(1 - snip.y) * 100}%`, marginBottom: 6 }
+                      : { top: `${(snip.y + snip.h) * 100}%`, marginTop: 6 }),
+                  }}
+                >
+                  <button
+                    onClick={() => snipBlobRef.current && copySnipToClipboard(snipBlobRef.current)}
+                    className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-paper hover:bg-ink-600"
+                    title="Copy the snip again"
+                  >
+                    <Copy size={14} /> Copy
+                  </button>
+                  <button
+                    onClick={saveSnip}
+                    className="flex items-center gap-1.5 rounded px-2 py-1 text-xs text-paper hover:bg-ink-600"
+                    title="Save the snip as a PNG picture in Downloads"
+                  >
+                    <Download size={14} /> Save PNG
+                  </button>
+                  <button
+                    onClick={() => setSnip(null)}
+                    className="flex h-6 w-6 items-center justify-center rounded text-muted hover:bg-ink-600 hover:text-paper"
+                    title="Close (Esc)"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </>
+            )}
             {activeTool === 'crop' && drag && dragNow && (
               <CropMarquee
                 x={Math.min(drag.x, dragNow.x)}
@@ -1206,9 +1349,8 @@ export default function Canvas() {
                   a.type === 'image' && !!a.dataUrl
               )
               .map((a) => (
-                <img
+                <div
                   key={a.id}
-                  src={a.dataUrl}
                   onMouseDown={(e) => {
                     setSelectedAnnotationId(a.id);
                     startSmoothDrag(e, a.x, a.y, (x, y) => {
@@ -1221,7 +1363,9 @@ export default function Canvas() {
                       );
                     });
                   }}
-                  className="pointer-events-auto group absolute cursor-move border border-transparent hover:border-accent"
+                  className={`pointer-events-auto group absolute cursor-move border ${
+                    selectedAnnotationId === a.id ? 'border-dashed border-accent' : 'border-transparent hover:border-accent'
+                  }`}
                   style={{
                     left: `${a.x * 100}%`,
                     top: `${a.y * 100}%`,
@@ -1232,8 +1376,38 @@ export default function Canvas() {
                     e.stopPropagation();
                     deleteAnnotation(doc.id, currentPage, a.id);
                   }}
-                  title="Drag to move, double-click to remove"
-                />
+                  title="Drag to move, drag the corner to resize, double-click to remove"
+                >
+                  <img src={a.dataUrl} alt="" draggable={false} className="pointer-events-none block h-full w-full select-none" />
+                  {/* corner handle: resizes keeping the picture's shape */}
+                  <span
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      setSelectedAnnotationId(a.id);
+                      const overlay = overlayRef.current;
+                      if (!overlay) return;
+                      const startX = e.clientX;
+                      const ratio = a.h / a.w;
+                      const onMove = (ev: MouseEvent) => {
+                        const rect = overlay.getBoundingClientRect();
+                        let w = Math.max(0.02, Math.min(1 - a.x, a.w + (ev.clientX - startX) / rect.width));
+                        if (a.y + w * ratio > 1) w = (1 - a.y) / ratio;
+                        updateImageSize(doc.id, currentPage, a.id, w, w * ratio);
+                      };
+                      const onUp = () => {
+                        window.removeEventListener('mousemove', onMove);
+                        window.removeEventListener('mouseup', onUp);
+                      };
+                      window.addEventListener('mousemove', onMove);
+                      window.addEventListener('mouseup', onUp);
+                    }}
+                    className={`absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-nwse-resize rounded-sm border border-white bg-accent shadow ${
+                      selectedAnnotationId === a.id ? '' : 'opacity-0 group-hover:opacity-100'
+                    }`}
+                    title="Drag to resize"
+                  />
+                </div>
               ))}
 
             {(formFields[doc.id] ?? [])
